@@ -1,0 +1,47 @@
+[tool.poetry]
+name = "jax-prism"
+version = "0.1.0-dev"
+description = "Privacy-preserving probabilistic forecasting with JAX"
+authors = ["Guillaume Decina"]
+readme = "README.md"
+packages = [{include = "jax_prism"}]
+package-mode = false
+
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.poetry.dependencies]
+python = ">=3.11,<3.13"
+
+# Core
+jax = "^0.7.0"
+jaxlib = "^0.7.0"
+
+# Neural network modules
+flax = "^0.10.0"
+
+# Optimizer
+optax = "^0.2.0"
+
+# Bayesian inference (v0.2.0+)
+numpyro = "^0.16.0"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.0"
+ruff = "^0.3.0"
+chex = "^0.1.91"
+hypothesis = "^6.100"
+ipykernel = "^7.1.0"
+
+[tool.ruff]
+line-length = 88
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = ["E501"]  # Line length handled by formatter
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v --tb=short"

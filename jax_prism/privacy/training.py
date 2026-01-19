@@ -1,0 +1,210 @@
+"""High-level DP-SGD training utilities.
+
+This module provides factory functions that create JIT-compiled training
+step functions with built-in differential privacy.
+
+Two levels of abstraction:
+- `make_dp_train_step`: For custom training loops (Option C)
+- `Trainer` class: Convenience wrapper (Option D, in nn/trainer.py)
+
+References:
+    Abadi et al., "Deep Learning with Differential Privacy", CCS 2016.
+"""
+
+from typing import Callable, NamedTuple
+
+import jax
+import jax.numpy as jnp
+import optax
+
+from jax_prism._typing import Array, Loss, PRNGKey, PyTree, PrivacyAccountant
+from jax_prism.data.batch import TimeSeriesBatch
+from jax_prism.privacy.gradients import dp_gradients
+
+
+class TrainStepOutput(NamedTuple):
+    """Output from a single training step."""
+
+    params: PyTree
+    opt_state: PyTree
+    accountant: PrivacyAccountant
+    metrics: dict[str, Array]
+
+
+def make_dp_train_step(
+    model_apply: Callable[[PyTree, TimeSeriesBatch, bool], Array],
+    loss_fn: Loss,
+    optimizer: optax.GradientTransformation,
+    clip_norm: float,
+    noise_multiplier: float,
+    *,
+    target_field: str = "target",
+) -> Callable[
+    [PyTree, PyTree, PrivacyAccountant, TimeSeriesBatch, PRNGKey],
+    TrainStepOutput,
+]:
+    """Create a JIT-compiled DP-SGD training step function.
+
+    This factory creates a training step that:
+    1. Computes per-sample gradients
+    2. Clips each gradient to bound sensitivity
+    3. Aggregates (averages) clipped gradients
+    4. Adds calibrated Gaussian noise
+    5. Updates parameters with optimizer
+    6. Updates privacy accountant
+
+    Args:
+        model_apply: Function (params, batch, training) -> raw_output.
+            Typically model.apply for a Flax model.
+        loss_fn: Loss function conforming to Loss protocol.
+            Called as loss_fn(predictions, targets, mask).
+        optimizer: Optax optimizer (e.g., optax.adam(1e-3)).
+        clip_norm: Maximum L2 norm for per-sample gradients.
+        noise_multiplier: σ, ratio of noise std to clip_norm.
+        target_field: Field name in batch for targets (default: "target").
+
+    Returns:
+        A JIT-compiled function with signature:
+            (params, opt_state, accountant, batch, key) -> TrainStepOutput
+
+    Example:
+        >>> model = TFT(config)
+        >>> params = model.init(key, sample_batch)
+        >>> loss_fn = NLLLoss(GaussianHead())
+        >>> optimizer = optax.adam(1e-3)
+        >>> opt_state = optimizer.init(params)
+        >>>
+        >>> train_step = make_dp_train_step(
+        ...     model.apply,
+        ...     loss_fn,
+        ...     optimizer,
+        ...     clip_norm=1.0,
+        ...     noise_multiplier=1.1,
+        ... )
+        >>>
+        >>> # Training loop
+        >>> for batch in dataloader:
+        ...     key, subkey = jax.random.split(key)
+        ...     params, opt_state, accountant, metrics = train_step(
+        ...         params, opt_state, accountant, batch, subkey
+        ...     )
+        ...     print(f"Loss: {metrics['loss']:.4f}")
+    """
+
+    def single_example_loss(params: PyTree, example: TimeSeriesBatch) -> Array:
+        """Compute loss for a single example."""
+        # Forward pass (training=True)
+        raw_output = model_apply(params, example, True)
+
+        # Get target from batch
+        target = getattr(example, target_field)
+
+        # Get mask if available
+        mask = getattr(example, "mask", None)
+
+        # Compute loss
+        return loss_fn(raw_output, target, mask)
+
+    def train_step(
+        params: PyTree,
+        opt_state: PyTree,
+        accountant: PrivacyAccountant,
+        batch: TimeSeriesBatch,
+        key: PRNGKey,
+    ) -> TrainStepOutput:
+        """Execute one DP-SGD training step."""
+        # Get batch size for sample rate computation
+        batch_size = batch.target.shape[0]
+
+        # Compute per-sample gradients using vmap
+        grad_fn = jax.grad(single_example_loss)
+        per_sample_grads = jax.vmap(grad_fn, in_axes=(None, 0))(params, batch)
+
+        # Apply DP: clip, aggregate, add noise
+        dp_grads = dp_gradients(
+            per_sample_grads,
+            clip_norm=clip_norm,
+            noise_multiplier=noise_multiplier,
+            key=key,
+        )
+
+        # Compute metrics (on clipped grads before noise for interpretability)
+        # We compute loss separately for metrics (no noise influence)
+        raw_output = model_apply(params, batch, False)
+        target = getattr(batch, target_field)
+        mask = getattr(batch, "mask", None)
+        loss_value = loss_fn(raw_output, target, mask)
+
+        # Update parameters
+        updates, new_opt_state = optimizer.update(dp_grads, opt_state, params)
+        new_params = optax.apply_updates(params, updates)
+
+        # Update accountant
+        # Note: sample_rate should be batch_size / dataset_size, but we
+        # don't have dataset_size here. User should call accountant.step
+        # separately if precise accounting is needed.
+        # For now, we assume sample_rate=1.0 (conservative)
+        new_accountant = accountant.step(
+            noise_multiplier=noise_multiplier,
+            sample_rate=1.0,  # Conservative; override externally if needed
+            num_steps=1,
+        )
+
+        metrics = {
+            "loss": loss_value,
+            "batch_size": jnp.array(batch_size, dtype=jnp.int32),
+        }
+
+        return TrainStepOutput(
+            params=new_params,
+            opt_state=new_opt_state,
+            accountant=new_accountant,
+            metrics=metrics,
+        )
+
+    # JIT compile the training step
+    return jax.jit(train_step)
+
+
+def make_train_step(
+    model_apply: Callable[[PyTree, TimeSeriesBatch, bool], Array],
+    loss_fn: Loss,
+    optimizer: optax.GradientTransformation,
+    *,
+    target_field: str = "target",
+) -> Callable[[PyTree, PyTree, TimeSeriesBatch], tuple[PyTree, PyTree, dict]]:
+    """Create a JIT-compiled training step WITHOUT differential privacy.
+
+    For comparison and baseline experiments.
+
+    Args:
+        model_apply: Function (params, batch, training) -> raw_output.
+        loss_fn: Loss function conforming to Loss protocol.
+        optimizer: Optax optimizer.
+        target_field: Field name in batch for targets.
+
+    Returns:
+        JIT-compiled function: (params, opt_state, batch) -> (params, opt_state, metrics)
+    """
+
+    def loss_fn_wrapper(params: PyTree, batch: TimeSeriesBatch) -> Array:
+        raw_output = model_apply(params, batch, True)
+        target = getattr(batch, target_field)
+        mask = getattr(batch, "mask", None)
+        return loss_fn(raw_output, target, mask)
+
+    @jax.jit
+    def train_step(
+        params: PyTree,
+        opt_state: PyTree,
+        batch: TimeSeriesBatch,
+    ) -> tuple[PyTree, PyTree, dict]:
+        loss_value, grads = jax.value_and_grad(loss_fn_wrapper)(params, batch)
+
+        updates, new_opt_state = optimizer.update(grads, opt_state, params)
+        new_params = optax.apply_updates(params, updates)
+
+        metrics = {"loss": loss_value}
+        return new_params, new_opt_state, metrics
+
+    return train_step
