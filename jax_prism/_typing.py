@@ -131,6 +131,18 @@ class DistributionHead(Protocol):
     A DistributionHead transforms raw model outputs into distribution
     parameters and provides methods for computing log probabilities
     and sampling.
+
+    Shape Convention:
+        All methods preserve a trailing feature dimension of 1 for univariate
+        forecasting. This ensures consistent shapes throughout the pipeline:
+
+        - Raw model output: (B, T, num_params)
+        - Distribution params (e.g., loc, scale): (B, T, 1)
+        - Targets: (B, T, 1)
+        - Log probabilities: (B, T, 1)
+        - Point predictions (mean/median): (B, T, 1)
+
+        For multivariate forecasting with F features, shapes become (B, T, F).
     """
 
     @property
@@ -145,7 +157,7 @@ class DistributionHead(Protocol):
             raw: Raw output from model, shape (..., num_params).
 
         Returns:
-            Dictionary mapping parameter names to arrays.
+            Dictionary mapping parameter names to arrays, each shape (..., 1).
         """
         ...
 
@@ -153,11 +165,11 @@ class DistributionHead(Protocol):
         """Compute log probability of targets under the distribution.
 
         Args:
-            params: Distribution parameters from params_from_raw.
-            targets: Target values, shape (...,).
+            params: Distribution parameters from params_from_raw, each (..., 1).
+            targets: Target values, shape (..., 1).
 
         Returns:
-            Log probabilities, same shape as targets.
+            Log probabilities, shape (..., 1).
         """
         ...
 
@@ -172,7 +184,7 @@ class DistributionHead(Protocol):
             sample_shape: Shape of samples to draw.
 
         Returns:
-            Samples with shape (*sample_shape, ...).
+            Samples with shape (*sample_shape, ..., 1).
         """
         ...
 
@@ -183,6 +195,11 @@ class Loss(Protocol):
 
     Loss functions compute scalar losses from predictions and targets,
     optionally using a distribution head for probabilistic losses.
+
+    Shape Convention:
+        - predictions: (B, T, num_params) — raw model output
+        - targets: (B, T, 1) — ground truth with trailing feature dim
+        - mask: (B, T, 1) — optional mask with same shape as targets
     """
 
     def __call__(
@@ -194,9 +211,9 @@ class Loss(Protocol):
         """Compute the loss.
 
         Args:
-            predictions: Model predictions.
-            targets: Ground truth targets.
-            mask: Optional mask (1 = valid, 0 = ignore).
+            predictions: Model predictions, shape (B, T, num_params).
+            targets: Ground truth targets, shape (B, T, 1).
+            mask: Optional mask, shape (B, T, 1). 1 = valid, 0 = ignore.
 
         Returns:
             Scalar loss value.

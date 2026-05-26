@@ -4,7 +4,7 @@
 install-mac:
 	@echo "Installing for MacOS (MPS/CPU)..."
 	poetry install
-	@echo "Setup complete. Do'nt forget to run: source .envrc"
+	@echo "Setup complete. Don't forget to run: source .envrc"
 
 # For Linux/CUDA
 install-cuda:

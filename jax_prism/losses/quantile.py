@@ -1,5 +1,7 @@
 """Quantile (Pinball) loss for quantile regression."""
 
+import warnings
+
 import jax
 import jax.numpy as jnp
 
@@ -29,7 +31,7 @@ class QuantileLoss:
         self,
         quantiles: Array,
         enforce_monotonicity: bool = True,
-        calibration_weight: float = 0.0,
+        calibration_weight: float | tuple[float, ...] = 1.0,
         calibration_sharpness: float = 10.0,
     ):
         """Initialize with target quantile levels.
@@ -39,28 +41,55 @@ class QuantileLoss:
                     e.g., jnp.array([0.1, 0.5, 0.9])
             enforce_monotonicity: If True, transform predictions to ensure
                     quantile ordering via cumulative softplus deltas.
-            calibration_weight: Weight for calibration regularization term.
-                    If > 0, adds a loss term penalizing coverage deviation
-                    from target for symmetric quantile pairs.
+            calibration_weight: Loss term penalizing coverage deviation
+                    from target for symmetric quantile pairs. Can be:
+                    - float: Same weight for all pairs
+                    - tuple: Per-pair weights, ordered from inner to outer
+                        e.g., for [0.1, 0.25, 0.5, 0.75, 0.9]:
+                        (weight_50_PI, weight_80_PI) for pairs (0.25,0.75), (0.1,0.9)
             calibration_sharpness: Sharpness of soft coverage sigmoid (k).
                     Higher = sharper approximation to hard coverage.
         """
         self.quantiles = jnp.asarray(quantiles)
         self.enforce_monotonicity = enforce_monotonicity
-        self.calibration_weight = calibration_weight
         self.calibration_sharpness = calibration_sharpness
 
         # Precompute symmetric quantile pairs and their target coverages
-        # e.g., (0.1, 0.9) -> 0.8 coverage, (0.3, 0.7) -> 0.4 coverage
+        # e.g., (0.1, 0.9) -> 0.8 coverage, (0.25, 0.75) -> 0.5 coverage
+        # Pairs are ordered inner to outer (closest to median first)
         self._calibration_pairs = []
         q_array = jnp.asarray(quantiles)
         n = len(q_array)
-        for i in range(n // 2):
+        for i in range(n // 2 - 1, -1, -1):  # Reverse: inner pairs first
             lower_q = float(q_array[i])
             upper_q = float(q_array[n - 1 - i])
             if abs((1 - upper_q) - lower_q) < 0.01:  # Symmetric pair
                 target_coverage = upper_q - lower_q
                 self._calibration_pairs.append((i, n - 1 - i, target_coverage))
+
+        # Handle calibration_weight as scalar or per-pair tuple
+        if isinstance(calibration_weight, (list, tuple)):
+            if len(calibration_weight) != len(self._calibration_pairs):
+                raise ValueError(
+                    f"Calibration_weight tuple length ({len(calibration_weight)}) "
+                    f"must match number of symmetric pairs ({len(self._calibration_pairs)}). "
+                    f"Pairs (inner to outer): {[(p[2]) for p in self._calibration_pairs]}"
+                )
+            self._calibration_weights = tuple(calibration_weight)
+        else:
+            self._calibration_weights = tuple(
+                calibration_weight for _ in self._calibration_pairs
+            )
+
+        # Warn if all calibration weights are zero with monotonicity enforcement
+        if enforce_monotonicity and all(w == 0.0 for w in self._calibration_weights):
+            warnings.warn(
+                "All calibration_weights are 0.0 with enforce_monotonicity=True. "
+                "This may cause prediction intervals to collapse. "
+                "Consider calibration_weight >= 0.1.",
+                UserWarning,
+                stacklevel=2,
+            )
 
     def transform_predictions(self, raw_predictions: Array) -> Array:
         """Transform raw predictions to centered monotonic quantiles.
@@ -123,8 +152,8 @@ class QuantileLoss:
         Args:
             predictions: Raw model output, shape (..., num_quantiles).
                 If enforce_monotonicity=True, these are transformed first.
-            targets: Ground truth values, shape (...).
-            mask: Optional mask, shape (...). 1 = valid, 0 = ignore.
+            targets: Ground truth values, shape (..., 1).
+            mask: Optional mask, shape (..., 1). 1 = valid, 0 = ignore.
 
         Returns:
             Scalar mean quantile loss.
@@ -156,12 +185,13 @@ class QuantileLoss:
         else:
             base_loss = jnp.mean(loss_per_point)
 
-        # Add calibration loss if enabled
-        if self.calibration_weight > 0 and len(self._calibration_pairs) > 0:
+        # Add calibration loss if enabled (any non-zero weight)
+        if any(w > 0 for w in self._calibration_weights) and len(self._calibration_pairs) > 0:
             calibration_loss = self._compute_calibration_loss(
                 predictions, targets_expanded.squeeze(-1), mask
             )
-            return base_loss + self.calibration_weight * calibration_loss
+            # Weights already applied per-pair in _compute_calibration_loss
+            return base_loss + calibration_loss
 
         return base_loss
 
@@ -179,12 +209,18 @@ class QuantileLoss:
             mask: Optional mask.
 
         Returns:
-            Scalar calibration loss.
+            Scalar calibration loss (weighted average across pairs).
         """
         k = self.calibration_sharpness
         total_loss = jnp.array(0.0)
+        total_weight = 0.0
 
-        for lower_idx, upper_idx, target_coverage in self._calibration_pairs:
+        for (lower_idx, upper_idx, target_coverage), weight in zip(
+            self._calibration_pairs, self._calibration_weights
+        ):
+            if weight == 0.0:
+                continue
+
             q_lower = predictions[..., lower_idx]
             q_upper = predictions[..., upper_idx]
 
@@ -201,7 +237,8 @@ class QuantileLoss:
             else:
                 soft_coverage = jnp.mean(soft_in_interval)
 
-            # Penalize deviation from target coverage
-            total_loss = total_loss + (target_coverage - soft_coverage) ** 2
+            # Penalize deviation from target coverage (weighted)
+            total_loss = total_loss + weight * (target_coverage - soft_coverage) ** 2
+            total_weight += weight
 
-        return total_loss / max(len(self._calibration_pairs), 1)
+        return total_loss / max(total_weight, 1.0)

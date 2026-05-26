@@ -175,6 +175,46 @@ class TestInverseScale:
 
         assert_trees_all_close(x_recovered, x_orig)
 
+    def test_2d_input_shape(self):
+        """Handles 2D input (B, T) gracefully."""
+        scaled_x = jnp.ones((4, 10))  # B=4, T=10, no F dimension
+        scale = jnp.ones((4,)) * 2.0
+        x = inverse_scale(scaled_x, scale)
+
+        assert_shape(x, (4, 10))
+
+    def test_2d_multiplies_correctly(self):
+        """Correctly multiplies 2D input by scale."""
+        scaled_x = jnp.array([[1.0, 2.0, 3.0], [0.5, 1.0, 1.5]])  # (2, 3)
+        scale = jnp.array([4.0, 2.0])  # (2,)
+        x = inverse_scale(scaled_x, scale)
+
+        expected = jnp.array([[4.0, 8.0, 12.0], [1.0, 2.0, 3.0]])
+        assert_trees_all_close(x, expected)
+
+    def test_2d_with_scale_trailing_dim(self):
+        """Handles 2D input with scale shape (B, 1)."""
+        scaled_x = jnp.array([[1.0, 2.0, 3.0]])  # (1, 3)
+        scale = jnp.array([[4.0]])  # (1, 1) - common from 3D scaling
+        x = inverse_scale(scaled_x, scale)
+
+        expected = jnp.array([[4.0, 8.0, 12.0]])
+        assert_trees_all_close(x, expected)
+
+    def test_2d_roundtrip(self):
+        """Scale 3D, squeeze to 2D, inverse_scale back."""
+        x_orig = jnp.array([[[1.0], [2.0], [4.0]]])  # (1, 3, 1)
+        scaled_x, scale = last_value_scale(x_orig)
+
+        # Squeeze predictions (common pattern)
+        scaled_x_2d = scaled_x.squeeze(-1)  # (1, 3)
+        scale_1d = scale.squeeze(-1)  # (1,)
+
+        x_recovered_2d = inverse_scale(scaled_x_2d, scale_1d)
+        x_recovered = x_recovered_2d[..., None]  # Add back F dim
+
+        assert_trees_all_close(x_recovered, x_orig)
+
 
 class TestBatchBehavior:
     """Tests for correct batch handling."""

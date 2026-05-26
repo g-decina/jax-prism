@@ -173,7 +173,7 @@ class TestNLLLossJAXCompatibility:
         loss_fn = NLLLoss(distribution=head)
 
         predictions = jax.random.normal(rng_key, (4, 8, 2))
-        targets = jax.random.normal(rng_key, (4, 8))
+        targets = jax.random.normal(rng_key, (4, 8, 1))
 
         @jax.jit
         def compute_loss(preds, targs):
@@ -189,7 +189,7 @@ class TestNLLLossJAXCompatibility:
         loss_fn = NLLLoss(distribution=head)
 
         predictions = jax.random.normal(rng_key, (4, 8, 2))
-        targets = jax.random.normal(rng_key, (4, 8))
+        targets = jax.random.normal(rng_key, (4, 8, 1))
         mask = jax.random.bernoulli(rng_key, 0.8, (4, 8)).astype(jnp.float32)
 
         @jax.jit
@@ -205,7 +205,7 @@ class TestNLLLossJAXCompatibility:
         head = GaussianHead()
         loss_fn = NLLLoss(distribution=head)
 
-        targets = jax.random.normal(rng_key, (4, 8))
+        targets = jax.random.normal(rng_key, (4, 8, 1))
 
         def loss_wrapper(predictions):
             return loss_fn(predictions, targets)
@@ -222,8 +222,8 @@ class TestNLLLossJAXCompatibility:
         loss_fn = NLLLoss(distribution=head)
 
         targets = jax.random.normal(rng_key, (4, 8))
-        mask = jnp.ones((4, 8))
-        mask = mask.at[:, 4:].set(0)  # Mask out second half
+        mask = jnp.ones((4, 8, 1))
+        mask = mask.at[:, 4:, :].set(0)  # Mask out second half
 
         def loss_wrapper(predictions):
             return loss_fn(predictions, targets, mask=mask)
@@ -244,7 +244,7 @@ class TestNLLLossJAXCompatibility:
 
         # Batch of prediction-target pairs
         predictions = jax.random.normal(rng_key, (8, 16, 2))
-        targets = jax.random.normal(rng_key, (8, 16))
+        targets = jax.random.normal(rng_key, (8, 16, 1))
 
         # vmap over first dimension
         vmapped_loss = jax.vmap(loss_fn)
@@ -344,7 +344,7 @@ class TestQuantileLossBehavior:
     def test_zero_loss_when_perfect(self):
         """Loss should be zero when predictions equal targets at all quantiles."""
         quantiles = jnp.array([0.1, 0.5, 0.9])
-        loss_fn = QuantileLoss(quantiles)
+        loss_fn = QuantileLoss(quantiles, enforce_monotonicity=False)
 
         targets = jnp.array([1.0, 2.0, 3.0])
         # Predictions: each target repeated for all quantiles

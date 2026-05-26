@@ -1,6 +1,10 @@
 """TFT configuration."""
 
 from dataclasses import dataclass
+from typing import Any, Callable
+
+# Type alias for Flax initializers
+Initializer = Callable[[Any, tuple[int, ...], Any], Any]
 
 
 @dataclass(frozen=True)
@@ -11,14 +15,19 @@ class ParamHeadConfig:
     for each distribution parameter (e.g., μ and σ for Gaussian).
 
     Attributes:
+        output_dim: Number of outputs for this head.
         dropout_rate: Dropout probability for this head's GRN.
             None inherits from TFTConfig.dropout_rate.
         hidden_size: Hidden dimension for this head's GRN.
             None inherits from TFTConfig.hidden_size.
+        use_output_bias: Whether to add an explicit OutputBias module
+            after the projection. Helps with offset correction during
+            phased training. Default True.
     """
-
+    output_dim: int = 1
     dropout_rate: float | None = None
     hidden_size: int | None = None
+    use_output_bias: bool = True
 
 
 @dataclass(frozen=True)
@@ -73,6 +82,16 @@ class TFTConfig:
     # Per-parameter output heads (optional)
     param_head_configs: tuple[ParamHeadConfig, ...] | None = None
 
+    # Output layer initialization (for single-head path only)
+    # Use jax_prism.nn.quantile_bias_init for quantile regression
+    output_bias_init: Initializer | None = None
+
+    # Whether to add a separate OutputBias module after output projection.
+    # This is crucial for quantile regression where initial delta outputs
+    # need to be positive to avoid softplus saturation.
+    # When True, use output_bias_init to set the initial bias values.
+    use_output_bias: bool = False
+
     def __post_init__(self):
         """Validate configuration."""
         if self.num_kv_heads is None:
@@ -92,10 +111,11 @@ class TFTConfig:
             )
 
         if self.param_head_configs is not None:
-            if len(self.param_head_configs) != self.num_output_params:
+            total_outputs = sum(h.output_dim for h in self.param_head_configs)
+            if total_outputs != self.num_output_params:
                 raise ValueError(
-                    f"param_head_configs length ({len(self.param_head_configs)}) "
-                    f"must match num_output_params ({self.num_output_params})"
+                    f"Sum of param_head_configs output_dims ({total_outputs}) "
+                    f"must match num_output_params ({self.num_output_params})."
                 )
 
     @property

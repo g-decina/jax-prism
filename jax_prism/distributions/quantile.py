@@ -31,7 +31,7 @@ class QuantileHead:
 
         Args:
             quantiles: 1D array of quantile levels in (0, 1).
-                       Should be sorted ascending.
+                    Should be sorted ascending.
         """
         self.quantiles = jnp.asarray(quantiles)
 
@@ -120,7 +120,7 @@ class QuantileHead:
             params: Dict with 'quantile_values' and 'quantile_levels'.
 
         Returns:
-            Median values, shape (...).
+            Median values, shape (..., 1).
         """
         quantile_values = params["quantile_values"]  # (..., Q)
         quantile_levels = params["quantile_levels"]  # (Q,)
@@ -135,7 +135,7 @@ class QuantileHead:
         original_shape = quantile_values.shape[:-1]
         flat_qv = quantile_values.reshape(-1, len(quantile_levels))
         flat_median = jax.vmap(interp_median)(flat_qv)
-        return flat_median.reshape(original_shape)
+        return flat_median.reshape(original_shape + (1,))  # Keep trailing dim
 
     def mean(self, params: dict[str, Array]) -> Array:
         """Return median as point prediction (mean not well-defined)."""
@@ -151,7 +151,7 @@ class QuantileHead:
             coverage: Desired coverage, e.g., 0.8 for 80% interval.
 
         Returns:
-            (lower, upper) bounds.
+            (lower, upper) bounds, each shape (..., 1).
         """
         quantile_values = params["quantile_values"]  # (..., Q)
         quantile_levels = params["quantile_levels"]  # (Q,)
@@ -168,4 +168,7 @@ class QuantileHead:
         flat_qv = quantile_values.reshape(-1, len(quantile_levels))
         flat_lower, flat_upper = jax.vmap(interp_bounds)(flat_qv)
 
-        return flat_lower.reshape(original_shape), flat_upper.reshape(original_shape)
+        return (
+            flat_lower.reshape(original_shape + (1,)),
+            flat_upper.reshape(original_shape + (1,)),
+        )

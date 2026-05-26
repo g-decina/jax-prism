@@ -27,11 +27,22 @@ from jax_prism._typing import Array
 from jax_prism.data.batch import TimeSeriesBatch
 from jax_prism.models.components import (
     GroupedQueryAttention,
+    OutputBias,
     RMSNorm,
     SwiGLU,
 )
 from jax_prism.models.tft.components import GRN, VariableSelectionNetwork
 from jax_prism.models.tft.config import ParamHeadConfig, TFTConfig
+
+BACKBONE_PATTERNS = [
+    "encoder_vsn", "decoder_vsn", "static_context",
+    "encoder_lstm", "decoder_lstm",
+    "encoder_grn", "decoder_grn",
+    "static_enrichment",
+    "temporal_attention", "attention_norm", "attention_gate",
+    "feedforward", "ff_norm",
+]
+
 
 class StaticContextGenerator(nn.Module):
     """Generate 4 static context vectors from static features.
@@ -182,10 +193,10 @@ class TemporalFusionTransformer(nn.Module):
         # Output heads
         if cfg.param_head_configs is not None:
             # Separate head per distribution parameter
-            # Build lists then convert to tuples (Flax requires immutable)
             param_gates = []
             param_projs = []
             param_input_projs = []
+            param_output_biases = []
 
             for i, head_cfg in enumerate(cfg.param_head_configs):
                 hidden = head_cfg.hidden_size or cfg.hidden_size
@@ -198,7 +209,15 @@ class TemporalFusionTransformer(nn.Module):
                 param_gates.append(
                     GRN(hidden, dropout, name=f"param_{i}_gate")
                 )
-                param_projs.append(nn.Dense(1, name=f"param_{i}_proj"))
+                param_projs.append(nn.Dense(head_cfg.output_dim, name=f"param_{i}_proj"))
+
+                # Optional explicit output bias for offset correction
+                if head_cfg.use_output_bias:
+                    param_output_biases.append(
+                        OutputBias(features=head_cfg.output_dim, name=f"param_{i}_output_bias")
+                    )
+                else:
+                    param_output_biases.append(None)
 
                 # Input projection if this head uses different hidden size
                 if hidden != cfg.hidden_size:
@@ -211,12 +230,26 @@ class TemporalFusionTransformer(nn.Module):
             self.param_gates = param_gates
             self.param_projs = param_projs
             self.param_input_projs = param_input_projs
+            self.param_output_biases = param_output_biases
         else:
             # Original single-head path
             self.output_gate = GRN(
                 cfg.hidden_size, cfg.dropout_rate, name="output_gate"
             )
             self.output_proj = nn.Dense(cfg.num_output_params, name="output_proj")
+
+            # Optional separate OutputBias module for offset correction.
+            # This is critical for quantile regression: the Dense layer's
+            # kernel @ hidden term overwhelms any bias initialization, so we
+            # need a separate learnable offset initialized to positive values
+            # (e.g., [0, 2, 2, 2, 2] for 5 quantiles) to prevent softplus saturation.
+            if cfg.use_output_bias:
+                bias_init = cfg.output_bias_init or nn.initializers.zeros_init()
+                self.output_bias = OutputBias(
+                    features=cfg.num_output_params,
+                    initializer=bias_init,
+                    name="output_bias",
+                )
         
         # Causal mask
         self.causal_mask = self.variable(
@@ -325,12 +358,20 @@ class TemporalFusionTransformer(nn.Module):
         self,
         batch: TimeSeriesBatch,
         training: bool = False,
+        frozen_heads: tuple[int, ...] = (),
+        frozen_backbone: bool = False
     ) -> Array:
         """Forward pass.
 
         Args:
             batch: TimeSeriesBatch with all inputs.
             training: Whether in training mode (affects dropout).
+            frozen_heads: Indices of output heads to freeze (no gradient flow).
+                Only applies when using param_head_configs (separate heads).
+                Use for phased training, e.g. frozen_heads=(0,) to freeze
+                the mean while training the scale head.
+            frozen_backbone: If True, freezes the training of every parameter
+                except the heads. Useful to adjust specific head outputs.
 
         Returns:
             Output parameters, shape (B, decoder_length, num_output_params).
@@ -446,6 +487,7 @@ class TemporalFusionTransformer(nn.Module):
         # =========================================================
         # 10. Position-wise feedforward
         # =========================================================
+        
         ff_out = self.feedforward(temporal)
         ff_out = self.ff_dropout(ff_out, deterministic=not training)
         temporal = self.ff_norm(temporal + ff_out)  # Residual + norm
@@ -458,12 +500,23 @@ class TemporalFusionTransformer(nn.Module):
         # =========================================================
         # 12. Output projection
         # =========================================================
+        
+        if frozen_backbone:
+            # Freeze gradient flow through backbone paths
+            decoder_temporal = jax.lax.stop_gradient(decoder_temporal)
+            decoder_outputs = jax.lax.stop_gradient(decoder_outputs)
+        
         if cfg.param_head_configs is not None:
             # Process each parameter through its own head
             param_outputs = []
 
-            for i, (gate, proj, input_proj) in enumerate(
-                zip(self.param_gates, self.param_projs, self.param_input_projs)
+            for i, (gate, proj, input_proj, output_bias) in enumerate(
+                zip(
+                    self.param_gates,
+                    self.param_projs,
+                    self.param_input_projs,
+                    self.param_output_biases,
+                )
             ):
                 # Optionally project input to head's hidden size
                 head_input = decoder_temporal
@@ -476,6 +529,15 @@ class TemporalFusionTransformer(nn.Module):
                 gated = gate(head_input, deterministic=not training)
                 hidden = skip_input + gated
                 param_out = proj(hidden)  # (B, T_dec, 1)
+
+                # Optional explicit output bias for offset correction
+                if output_bias is not None:
+                    param_out = output_bias(param_out)
+
+                # Freeze this head if specified (blocks gradient flow)
+                if i in frozen_heads:
+                    param_out = jax.lax.stop_gradient(param_out)
+
                 param_outputs.append(param_out)
 
             output = jnp.concatenate(param_outputs, axis=-1)  # (B, T_dec, num_params)
@@ -486,5 +548,9 @@ class TemporalFusionTransformer(nn.Module):
             )
             output_hidden = decoder_outputs + decoder_gated
             output = self.output_proj(output_hidden)  # (B, T_dec, num_params)
+
+            # Apply separate output bias if configured
+            if cfg.use_output_bias:
+                output = self.output_bias(output)
 
         return output

@@ -23,14 +23,15 @@ class TestGaussianHeadParamsFromRaw:
         assert "scale" in params
 
     def test_output_shapes(self, rng_key):
-        """Params should have shape (...) from input (..., 2)."""
+        """Params should have shape (..., 1) from input (..., 2)."""
         head = GaussianHead()
         raw = jax.random.normal(rng_key, (4, 8, 2))
 
         params = head.params_from_raw(raw)
 
-        chex.assert_shape(params["loc"], (4, 8))
-        chex.assert_shape(params["scale"], (4, 8))
+        # Shapes match TimeSeriesBatch convention: (B, T, 1)
+        chex.assert_shape(params["loc"], (4, 8, 1))
+        chex.assert_shape(params["scale"], (4, 8, 1))
 
     def test_scale_positive(self, rng_key):
         """Scale should always be positive."""
@@ -53,13 +54,13 @@ class TestGaussianHeadParamsFromRaw:
         assert jnp.all(params["scale"] >= min_scale)
 
     def test_loc_unchanged(self, rng_key):
-        """Loc should equal raw[..., 0] unchanged."""
+        """Loc should equal raw[..., 0:1] unchanged (preserving trailing dim)."""
         head = GaussianHead()
         raw = jax.random.normal(rng_key, (4, 8, 2))
 
         params = head.params_from_raw(raw)
 
-        chex.assert_trees_all_close(params["loc"], raw[..., 0], atol=0)
+        chex.assert_trees_all_close(params["loc"], raw[..., 0:1], atol=0)
 
 
 class TestGaussianHeadLogProb:
@@ -117,7 +118,8 @@ class TestGaussianHeadLogProb:
         head = GaussianHead()
         raw = jax.random.normal(rng_key, (4, 8, 2))
         params = head.params_from_raw(raw)
-        targets = jax.random.normal(rng_key, (4, 8))
+        # Targets must match params shape convention (B, T, 1)
+        targets = jax.random.normal(rng_key, (4, 8, 1))
 
         log_probs = head.log_prob(params, targets)
 
@@ -201,33 +203,38 @@ class TestGaussianHeadQuantile:
     def test_output_shape(self, rng_key):
         """Quantile output shape should be (..., num_quantiles)."""
         head = GaussianHead()
-        params = {"loc": jnp.zeros((4, 8)), "scale": jnp.ones((4, 8))}
+        # Params need trailing dim for proper broadcasting with q
+        params = {"loc": jnp.zeros((4, 8, 1)), "scale": jnp.ones((4, 8, 1))}
         q = jnp.array([0.1, 0.5, 0.9])
 
         quantiles = head.quantile(params, q)
 
+        # (B, T, 1) * (Q,) broadcasts to (B, T, Q)
         chex.assert_shape(quantiles, (4, 8, 3))
 
     def test_median_equals_mean(self):
         """For Gaussian, median (q=0.5) should equal mean."""
         head = GaussianHead()
-        loc = jnp.array([3.0, -2.0, 0.0])
-        params = {"loc": loc, "scale": jnp.array([1.0, 2.0, 0.5])}
+        # Add trailing dim for proper broadcasting
+        loc = jnp.array([[3.0], [-2.0], [0.0]])  # (3, 1)
+        params = {"loc": loc, "scale": jnp.array([[1.0], [2.0], [0.5]])}  # (3, 1)
         q = jnp.array([0.5])
 
         quantiles = head.quantile(params, q)
 
-        chex.assert_trees_all_close(quantiles[..., 0], loc, atol=1e-5)
+        # quantiles shape is (3, 1), loc is (3, 1)
+        chex.assert_trees_all_close(quantiles, loc, atol=1e-5)
 
     def test_quantiles_ordered(self, rng_key):
         """Lower quantile levels should give lower values."""
         head = GaussianHead()
-        params = {"loc": jnp.zeros((4,)), "scale": jnp.ones((4,))}
+        # Add trailing dim for proper broadcasting with q
+        params = {"loc": jnp.zeros((4, 1)), "scale": jnp.ones((4, 1))}
         q = jnp.array([0.1, 0.5, 0.9])
 
         quantiles = head.quantile(params, q)
 
-        # q=0.1 < q=0.5 < q=0.9
+        # quantiles shape is (4, 3): q=0.1 < q=0.5 < q=0.9
         assert jnp.all(quantiles[..., 0] < quantiles[..., 1])
         assert jnp.all(quantiles[..., 1] < quantiles[..., 2])
 
@@ -279,21 +286,25 @@ class TestGaussianHeadJAXCompatibility:
     def test_jit_compatible(self, rng_key):
         """All methods should be JIT-compilable."""
         head = GaussianHead()
-        raw = jax.random.normal(rng_key, (4, 2))
+        # Use 3D input to match TimeSeriesBatch convention
+        raw = jax.random.normal(rng_key, (4, 8, 2))
 
         @jax.jit
         def forward(raw):
             params = head.params_from_raw(raw)
-            lp = head.log_prob(params, jnp.zeros(4))
+            # Targets must have matching shape (B, T, 1)
+            targets = jnp.zeros((4, 8, 1))
+            lp = head.log_prob(params, targets)
             samples = head.sample(params, rng_key)
             quants = head.quantile(params, jnp.array([0.5]))
             return lp, samples, quants
 
         lp, samples, quants = forward(raw)
 
-        chex.assert_shape(lp, (4,))
-        chex.assert_shape(samples, (4,))
-        chex.assert_shape(quants, (4, 1))
+        chex.assert_shape(lp, (4, 8, 1))
+        chex.assert_shape(samples, (4, 8, 1))
+        # quantile broadcasts q=(1,) with loc=(4,8,1) -> (4,8,1)
+        chex.assert_shape(quants, (4, 8, 1))
 
     def test_vmap_compatible(self, rng_key):
         """Methods should work with vmap."""
@@ -303,8 +314,9 @@ class TestGaussianHeadJAXCompatibility:
         # vmap over batch dimension
         vmapped_params = jax.vmap(head.params_from_raw)(raw)
 
-        chex.assert_shape(vmapped_params["loc"], (8, 4))
-        chex.assert_shape(vmapped_params["scale"], (8, 4))
+        # Trailing dimension preserved: (outer_batch, inner_batch, 1)
+        chex.assert_shape(vmapped_params["loc"], (8, 4, 1))
+        chex.assert_shape(vmapped_params["scale"], (8, 4, 1))
 
     def test_gradient_through_log_prob(self, rng_key):
         """Gradients should flow through log_prob."""
@@ -471,7 +483,7 @@ class TestQuantileHeadMedian:
 
         median = head.median(params)
 
-        chex.assert_shape(median, (4, 8))
+        chex.assert_shape(median, (4, 8, 1))
 
     def test_median_equals_middle_quantile(self):
         """When 0.5 is in quantiles, median should equal that value."""
@@ -482,7 +494,7 @@ class TestQuantileHeadMedian:
 
         median = head.median(params)
 
-        chex.assert_trees_all_close(median, jnp.array([5.0, 6.0]), atol=1e-5)
+        chex.assert_trees_all_close(median, jnp.array([[5.0], [6.0]]), atol=1e-5)
 
     def test_median_interpolation(self):
         """Median should interpolate when 0.5 is not in quantiles."""
@@ -493,7 +505,7 @@ class TestQuantileHeadMedian:
 
         median = head.median(params)
 
-        chex.assert_trees_all_close(median, jnp.array([4.0]), atol=1e-5)
+        chex.assert_trees_all_close(median, jnp.array([[4.0]]), atol=1e-5)
 
 
 class TestQuantileHeadMean:
@@ -524,8 +536,8 @@ class TestQuantileHeadPredictionInterval:
 
         lower, upper = head.prediction_interval(params, coverage=0.8)
 
-        chex.assert_shape(lower, (4, 8))
-        chex.assert_shape(upper, (4, 8))
+        chex.assert_shape(lower, (4, 8, 1))
+        chex.assert_shape(upper, (4, 8, 1))
 
     def test_lower_less_than_upper(self, rng_key):
         """Lower bound should be less than upper bound."""
@@ -549,8 +561,8 @@ class TestQuantileHeadPredictionInterval:
         lower, upper = head.prediction_interval(params, coverage=0.8)
 
         # For 80% coverage: lower_q=0.1, upper_q=0.9
-        chex.assert_trees_all_close(lower, jnp.array([1.0]), atol=1e-5)
-        chex.assert_trees_all_close(upper, jnp.array([9.0]), atol=1e-5)
+        chex.assert_trees_all_close(lower, jnp.array([[1.0]]), atol=1e-5)
+        chex.assert_trees_all_close(upper, jnp.array([[9.0]]), atol=1e-5)
 
     def test_wider_coverage(self):
         """Higher coverage should give wider intervals."""
@@ -587,9 +599,9 @@ class TestQuantileHeadJAXCompatibility:
 
         median, samples, lower, upper = forward(raw, rng_key)
 
-        chex.assert_shape(median, (4,))
-        chex.assert_shape(samples, (4,))
-        chex.assert_shape(lower, (4,))
+        chex.assert_shape(median, (4, 1))
+        chex.assert_shape(samples, (4, ))
+        chex.assert_shape(lower, (4, 1))
 
     def test_vmap_compatible(self, rng_key):
         """Methods should work with vmap."""

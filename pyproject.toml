@@ -1,11 +1,11 @@
 [tool.poetry]
 name = "jax-prism"
-version = "0.1.0-dev"
+version = "0.1.1-dev"
 description = "Privacy-preserving probabilistic forecasting with JAX"
 authors = ["Guillaume Decina"]
 readme = "README.md"
 packages = [{include = "jax_prism"}]
-package-mode = false
+package-mode = true
 
 [build-system]
 requires = ["poetry-core>=1.0.0"]
@@ -26,6 +26,9 @@ optax = "^0.2.0"
 
 # Bayesian inference (v0.2.0+)
 numpyro = "^0.16.0"
+
+# Data management
+pandas = "^2.0.0"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.0"

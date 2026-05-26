@@ -39,10 +39,10 @@ class GaussianHead:
             raw: Raw output, shape (..., 2).
 
         Returns:
-            Dictionary with 'loc' (μ) and 'scale' (σ).
+            Dictionary with 'loc' (μ) and 'scale' (σ), each shape (..., 1).
         """
-        loc = raw[..., 0]
-        scale_raw = raw[..., 1]
+        loc = raw[..., 0:1]
+        scale_raw = raw[..., 1:2]
         
         scale = jax.nn.softplus(scale_raw) + self.min_scale
         
@@ -52,13 +52,16 @@ class GaussianHead:
         """Compute log probability of targets under Gaussian.
 
         Args:
-            params: Dict with 'loc' and 'scale'.
-            targets: Target values, shape (...,).
+            params: Dict with 'loc' and 'scale', each shape (..., 1).
+            targets: Target values, shape (..., 1).
 
         Returns:
-            Log probabilities, same shape as targets.
+            Log probabilities, shape (..., 1).
         """
-        return jax.scipy.stats.norm.logpdf(targets, loc=params["loc"], scale=params["scale"])
+        # Targets: (B, T, 1), loc: (B, T, 1), scale: (B, T, 1)
+        return jax.scipy.stats.norm.logpdf(
+            targets, loc=params["loc"], scale=params["scale"]
+        )
 
     def sample(
         self, params: Dict[str, Array], key: PRNGKey, sample_shape: Shape = ()
@@ -94,4 +97,5 @@ class GaussianHead:
         """
         standard_quantiles = jax.scipy.stats.norm.ppf(q)
         
-        return params["loc"][..., None] + params["scale"][..., None] * standard_quantiles
+        # loc/scale: (..., 1), standard_quantiles: (Q,) → broadcast to (..., Q)
+        return params["loc"] + params["scale"] * standard_quantiles
