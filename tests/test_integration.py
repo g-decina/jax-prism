@@ -207,8 +207,8 @@ class TestNonDPTraining:
 
         output = model.apply(params, batch, training=True)
 
-        # Targets: (B, T_dec, 1) -> need to squeeze for loss
-        targets = batch.future_targets[..., 0]  # (B, T_dec)
+        # Targets: (B, T_dec, 1) - keep shape for NLL loss
+        targets = batch.future_targets
 
         loss = loss_fn(output, targets)
 
@@ -228,7 +228,8 @@ class TestNonDPTraining:
 
         def compute_loss(params, batch):
             output = model.apply(params, batch, training=True)
-            targets = batch.future_targets[..., 0]
+            # Targets: (B, T_dec, 1) - keep shape for NLL loss
+            targets = batch.future_targets
             return loss_fn(output, targets)
 
         initial_loss = compute_loss(params, batch)
@@ -359,24 +360,24 @@ class TestEndToEndWorkflow:
         # Extract distribution parameters
         dist_params = distribution.params_from_raw(output)
 
-        # Point prediction (mean)
-        point_pred = distribution.mean(dist_params)  # (B, T_dec)
+        # Point prediction (mean) - now returns (B, T_dec, 1)
+        point_pred = distribution.mean(dist_params)
 
-        # Targets
-        targets = batch.future_targets[..., 0]  # (B, T_dec)
+        # Targets: already (B, T_dec, 1)
+        targets = batch.future_targets
 
-        # Compute MAE
-        error = mae(targets[..., None], point_pred[..., None])
+        # Compute MAE - both are (B, T_dec, 1), no extra dims needed
+        error = mae(targets, point_pred)
         assert jnp.isfinite(error)
 
         # Compute prediction intervals (90%)
         q = jnp.array([0.05, 0.95])
         quantiles = distribution.quantile(dist_params, q)  # (B, T_dec, 2)
-        lower = quantiles[..., 0]
-        upper = quantiles[..., 1]
+        lower = quantiles[..., 0:1]  # (B, T_dec, 1)
+        upper = quantiles[..., 1:2]  # (B, T_dec, 1)
 
         # Compute coverage
-        cov = coverage(targets[..., None], lower[..., None], upper[..., None])
+        cov = coverage(targets, lower, upper)
         assert 0 <= cov <= 1
 
     def test_deterministic_inference(self, config, data):

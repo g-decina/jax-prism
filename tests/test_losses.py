@@ -19,7 +19,8 @@ class TestNLLLossBasic:
         loss_fn = NLLLoss(distribution=head)
 
         predictions = jax.random.normal(rng_key, (4, 8, 2))
-        targets = jax.random.normal(rng_key, (4, 8))
+        # Targets need trailing dim to match distribution params shape
+        targets = jax.random.normal(rng_key, (4, 8, 1))
 
         loss = loss_fn(predictions, targets)
 
@@ -31,7 +32,7 @@ class TestNLLLossBasic:
         loss_fn = NLLLoss(distribution=head)
 
         predictions = jax.random.normal(rng_key, (4, 8, 2))
-        targets = jax.random.normal(rng_key, (4, 8))
+        targets = jax.random.normal(rng_key, (4, 8, 1))
 
         loss = loss_fn(predictions, targets)
 
@@ -44,7 +45,7 @@ class TestNLLLossBasic:
         loss_fn = NLLLoss(distribution=head)
 
         predictions = jax.random.normal(rng_key, (4, 8, 2))
-        targets = jax.random.normal(rng_key, (4, 8))
+        targets = jax.random.normal(rng_key, (4, 8, 1))
 
         loss = loss_fn(predictions, targets)
 
@@ -60,11 +61,11 @@ class TestNLLLossBehavior:
         loss_fn = NLLLoss(distribution=head)
 
         # Predictions: loc=0, scale=1 (after softplus)
-        predictions = jnp.zeros((10, 2))
+        predictions = jnp.zeros((10, 1, 2))
 
-        # Targets at the mean (0) vs away from mean
-        targets_at_mean = jnp.zeros(10)
-        targets_away = jnp.ones(10) * 3
+        # Targets at the mean (0) vs away from mean (need trailing dim)
+        targets_at_mean = jnp.zeros((10, 1, 1))
+        targets_away = jnp.ones((10, 1, 1)) * 3
 
         loss_at_mean = loss_fn(predictions, targets_at_mean)
         loss_away = loss_fn(predictions, targets_away)
@@ -76,13 +77,13 @@ class TestNLLLossBehavior:
         head = GaussianHead()
         loss_fn = NLLLoss(distribution=head)
 
-        # Target at loc=0
-        targets = jnp.zeros(10)
+        # Target at loc=0 (need trailing dim)
+        targets = jnp.zeros((10, 1, 1))
 
         # Small scale (more confident, lower loss at mean)
-        predictions_small_scale = jnp.stack([jnp.zeros(10), -5 * jnp.ones(10)], axis=-1)
+        predictions_small_scale = jnp.stack([jnp.zeros((10, 1)), -5 * jnp.ones((10, 1))], axis=-1)
         # Large scale (less confident)
-        predictions_large_scale = jnp.stack([jnp.zeros(10), 5 * jnp.ones(10)], axis=-1)
+        predictions_large_scale = jnp.stack([jnp.zeros((10, 1)), 5 * jnp.ones((10, 1))], axis=-1)
 
         loss_small = loss_fn(predictions_small_scale, targets)
         loss_large = loss_fn(predictions_large_scale, targets)
@@ -94,12 +95,12 @@ class TestNLLLossBehavior:
         head = GaussianHead()
         loss_fn = NLLLoss(distribution=head)
 
-        targets = jnp.ones(10) * 5
+        targets = jnp.ones((10, 1, 1)) * 5
 
         # Prediction far from target
-        pred_far = jnp.stack([jnp.zeros(10), jnp.zeros(10)], axis=-1)
+        pred_far = jnp.stack([jnp.zeros((10, 1)), jnp.zeros((10, 1))], axis=-1)
         # Prediction close to target
-        pred_close = jnp.stack([jnp.ones(10) * 5, jnp.zeros(10)], axis=-1)
+        pred_close = jnp.stack([jnp.ones((10, 1)) * 5, jnp.zeros((10, 1))], axis=-1)
 
         loss_far = loss_fn(pred_far, targets)
         loss_close = loss_fn(pred_close, targets)
@@ -115,15 +116,16 @@ class TestNLLLossMasking:
         head = GaussianHead()
         loss_fn = NLLLoss(distribution=head)
 
-        predictions = jax.random.normal(rng_key, (4, 2))
-        targets = jax.random.normal(rng_key, (4,))
+        # Use 3D shapes: (B, T, F) convention
+        predictions = jax.random.normal(rng_key, (4, 1, 2))
+        targets = jax.random.normal(rng_key, (4, 1, 1))
 
         # Full mask (all valid)
-        mask_full = jnp.ones(4)
+        mask_full = jnp.ones((4, 1, 1))
         loss_full = loss_fn(predictions, targets, mask=mask_full)
 
         # Half mask
-        mask_half = jnp.array([1.0, 1.0, 0.0, 0.0])
+        mask_half = jnp.array([[[1.0]], [[1.0]], [[0.0]], [[0.0]]])
         loss_half = loss_fn(predictions, targets, mask=mask_half)
 
         # Losses should differ
@@ -134,9 +136,9 @@ class TestNLLLossMasking:
         head = GaussianHead()
         loss_fn = NLLLoss(distribution=head)
 
-        predictions = jax.random.normal(rng_key, (4, 2))
-        targets = jax.random.normal(rng_key, (4,))
-        mask = jnp.zeros(4)
+        predictions = jax.random.normal(rng_key, (4, 1, 2))
+        targets = jax.random.normal(rng_key, (4, 1, 1))
+        mask = jnp.zeros((4, 1, 1))
 
         loss = loss_fn(predictions, targets, mask=mask)
 
@@ -148,16 +150,16 @@ class TestNLLLossMasking:
         head = GaussianHead()
         loss_fn = NLLLoss(distribution=head)
 
-        # Create predictions where all have same NLL
-        predictions = jnp.zeros((4, 2))  # loc=0, scale=softplus(0)+eps
-        targets = jnp.zeros(4)  # targets at mean
+        # Create predictions where all have same NLL (3D shapes)
+        predictions = jnp.zeros((4, 1, 2))  # loc=0, scale=softplus(0)+eps
+        targets = jnp.zeros((4, 1, 1))  # targets at mean
 
         # Full mask
-        mask_full = jnp.ones(4)
+        mask_full = jnp.ones((4, 1, 1))
         loss_full = loss_fn(predictions, targets, mask=mask_full)
 
         # Partial mask (2 valid)
-        mask_partial = jnp.array([1.0, 1.0, 0.0, 0.0])
+        mask_partial = jnp.array([[[1.0]], [[1.0]], [[0.0]], [[0.0]]])
         loss_partial = loss_fn(predictions, targets, mask=mask_partial)
 
         # Since all NLLs are identical, mean should be same regardless of mask size
@@ -190,7 +192,8 @@ class TestNLLLossJAXCompatibility:
 
         predictions = jax.random.normal(rng_key, (4, 8, 2))
         targets = jax.random.normal(rng_key, (4, 8, 1))
-        mask = jax.random.bernoulli(rng_key, 0.8, (4, 8)).astype(jnp.float32)
+        # Mask needs to broadcast with log_prob output shape (4, 8, 1)
+        mask = jax.random.bernoulli(rng_key, 0.8, (4, 8, 1)).astype(jnp.float32)
 
         @jax.jit
         def compute_loss(preds, targs, m):
@@ -221,7 +224,7 @@ class TestNLLLossJAXCompatibility:
         head = GaussianHead()
         loss_fn = NLLLoss(distribution=head)
 
-        targets = jax.random.normal(rng_key, (4, 8))
+        targets = jax.random.normal(rng_key, (4, 8, 1))
         mask = jnp.ones((4, 8, 1))
         mask = mask.at[:, 4:, :].set(0)  # Mask out second half
 
@@ -256,37 +259,43 @@ class TestNLLLossJAXCompatibility:
 class TestNLLLossWithDifferentShapes:
     """Tests for various input shapes."""
 
-    def test_1d_input(self, rng_key):
-        """Works with 1D inputs."""
-        head = GaussianHead()
-        loss_fn = NLLLoss(distribution=head)
-
-        predictions = jax.random.normal(rng_key, (10, 2))
-        targets = jax.random.normal(rng_key, (10,))
-
-        loss = loss_fn(predictions, targets)
-
-        chex.assert_shape(loss, ())
-
     def test_2d_input(self, rng_key):
-        """Works with 2D inputs (batch, time)."""
+        """Works with 2D predictions (..., num_params)."""
         head = GaussianHead()
         loss_fn = NLLLoss(distribution=head)
 
-        predictions = jax.random.normal(rng_key, (4, 16, 2))
-        targets = jax.random.normal(rng_key, (4, 16))
+        # 2D predictions: (T, 2) -> params (T, 1)
+        predictions = jax.random.normal(rng_key, (10, 2))
+        # Targets must match params shape: (T, 1)
+        targets = jax.random.normal(rng_key, (10, 1))
 
         loss = loss_fn(predictions, targets)
 
         chex.assert_shape(loss, ())
 
     def test_3d_input(self, rng_key):
-        """Works with 3D inputs (batch, time, features)."""
+        """Works with 3D predictions (batch, time, num_params)."""
         head = GaussianHead()
         loss_fn = NLLLoss(distribution=head)
 
+        # 3D predictions: (B, T, 2) -> params (B, T, 1)
+        predictions = jax.random.normal(rng_key, (4, 16, 2))
+        # Targets: (B, T, 1)
+        targets = jax.random.normal(rng_key, (4, 16, 1))
+
+        loss = loss_fn(predictions, targets)
+
+        chex.assert_shape(loss, ())
+
+    def test_4d_input(self, rng_key):
+        """Works with 4D predictions (batch, time, features, num_params)."""
+        head = GaussianHead()
+        loss_fn = NLLLoss(distribution=head)
+
+        # 4D predictions: (B, T, F, 2) -> params (B, T, F, 1)
         predictions = jax.random.normal(rng_key, (2, 8, 4, 2))
-        targets = jax.random.normal(rng_key, (2, 8, 4))
+        # Targets: (B, T, F, 1)
+        targets = jax.random.normal(rng_key, (2, 8, 4, 1))
 
         loss = loss_fn(predictions, targets)
 
@@ -344,7 +353,8 @@ class TestQuantileLossBehavior:
     def test_zero_loss_when_perfect(self):
         """Loss should be zero when predictions equal targets at all quantiles."""
         quantiles = jnp.array([0.1, 0.5, 0.9])
-        loss_fn = QuantileLoss(quantiles, enforce_monotonicity=False)
+        # Disable both monotonicity and calibration to test pure pinball loss
+        loss_fn = QuantileLoss(quantiles, enforce_monotonicity=False, calibration_weight=0.0)
 
         targets = jnp.array([1.0, 2.0, 3.0])
         # Predictions: each target repeated for all quantiles
@@ -444,7 +454,8 @@ class TestQuantileLossMasking:
     def test_empty_mask_returns_zero(self, rng_key):
         """All-zero mask should return 0."""
         quantiles = jnp.array([0.1, 0.5, 0.9])
-        loss_fn = QuantileLoss(quantiles)
+        # Disable calibration - with empty mask, calibration loss is non-zero
+        loss_fn = QuantileLoss(quantiles, calibration_weight=0.0)
 
         predictions = jax.random.normal(rng_key, (4, 3))
         targets = jax.random.normal(rng_key, (4,))

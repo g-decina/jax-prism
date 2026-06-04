@@ -623,8 +623,8 @@ class TestParamHeadConfigs:
         chex.assert_shape(output, (2, config_separate_heads.decoder_length, 2))
 
     def test_invalid_param_head_configs_length(self):
-        """param_head_configs length must match num_output_params."""
-        with pytest.raises(ValueError, match="param_head_configs length"):
+        """param_head_configs total output_dims must match num_output_params."""
+        with pytest.raises(ValueError, match="param_head_configs output_dims"):
             TFTConfig(
                 hidden_size=32,
                 num_heads=2,
