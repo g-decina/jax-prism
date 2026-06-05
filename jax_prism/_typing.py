@@ -188,6 +188,32 @@ class DistributionHead(Protocol):
         """
         ...
 
+    def cdf(self, params: Dict[str, Array], x: Array) -> Array:
+        """Compute cumulative distribution function P(X <= x).
+
+        Args:
+            params: Distribution parameters from params_from_raw.
+            x: Values at which to evaluate CDF, shape (..., 1).
+
+        Returns:
+            CDF values in [0, 1], shape (..., 1).
+        """
+        ...
+
+    def quantile(self, params: Dict[str, Array], q: Array) -> Array:
+        """Compute quantile function (inverse CDF).
+
+        Returns x such that P(X <= x) = q.
+
+        Args:
+            params: Distribution parameters from params_from_raw.
+            q: Quantile levels in (0, 1), shape (num_quantiles,).
+
+        Returns:
+            Quantile values, shape (..., num_quantiles).
+        """
+        ...
+
 
 @runtime_checkable
 class Loss(Protocol):

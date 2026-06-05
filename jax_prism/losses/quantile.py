@@ -1,7 +1,5 @@
 """Quantile (Pinball) loss for quantile regression."""
 
-import warnings
-
 import jax
 import jax.numpy as jnp
 
@@ -18,19 +16,16 @@ class QuantileLoss:
 
     This asymmetric loss causes the model to predict the q-th quantile.
 
-    When enforce_monotonicity=True, raw predictions are transformed to ensure
-    quantile ordering (q_i <= q_{i+1}). The first output is the base quantile,
-    and subsequent outputs are positive deltas added cumulatively.
+    Expects predictions to already be transformed quantile values (e.g., from
+    QuantileHead.params_from_raw). Use QuantileHead to enforce monotonicity.
 
     Attributes:
         quantiles: Array of quantile levels to predict (must be sorted).
-        enforce_monotonicity: Whether to enforce q_i <= q_{i+1}.
     """
 
     def __init__(
         self,
         quantiles: Array,
-        enforce_monotonicity: bool = True,
         calibration_weight: float | tuple[float, ...] = 1.0,
         calibration_sharpness: float = 10.0,
     ):
@@ -39,8 +34,6 @@ class QuantileLoss:
         Args:
             quantiles: 1D array of quantile levels in (0, 1), sorted ascending.
                     e.g., jnp.array([0.1, 0.5, 0.9])
-            enforce_monotonicity: If True, transform predictions to ensure
-                    quantile ordering via cumulative softplus deltas.
             calibration_weight: Loss term penalizing coverage deviation
                     from target for symmetric quantile pairs. Can be:
                     - float: Same weight for all pairs
@@ -51,7 +44,6 @@ class QuantileLoss:
                     Higher = sharper approximation to hard coverage.
         """
         self.quantiles = jnp.asarray(quantiles)
-        self.enforce_monotonicity = enforce_monotonicity
         self.calibration_sharpness = calibration_sharpness
 
         # Precompute symmetric quantile pairs and their target coverages
@@ -81,66 +73,6 @@ class QuantileLoss:
                 calibration_weight for _ in self._calibration_pairs
             )
 
-        # Warn if all calibration weights are zero with monotonicity enforcement
-        if enforce_monotonicity and all(w == 0.0 for w in self._calibration_weights):
-            warnings.warn(
-                "All calibration_weights are 0.0 with enforce_monotonicity=True. "
-                "This may cause prediction intervals to collapse. "
-                "Consider calibration_weight >= 0.1.",
-                UserWarning,
-                stacklevel=2,
-            )
-
-    def transform_predictions(self, raw_predictions: Array) -> Array:
-        """Transform raw predictions to centered monotonic quantiles.
-
-        Uses a centered approach where median is independent and intervals
-        expand outward via cumulative softplus deltas.
-
-        For 5 quantiles [0.1, 0.25, 0.5, 0.75, 0.9], raw outputs are:
-            raw[0] = median (q50, unconstrained)
-            raw[1] = δ_inner_lower (q50 - q25 gap)
-            raw[2] = δ_outer_lower (q25 - q10 gap)
-            raw[3] = δ_inner_upper (q75 - q50 gap)
-            raw[4] = δ_outer_upper (q90 - q75 gap)
-
-        Args:
-            raw_predictions: Raw model output, shape (..., num_quantiles).
-
-        Returns:
-            Transformed predictions with guaranteed q_i <= q_{i+1}.
-        """
-        if not self.enforce_monotonicity:
-            return raw_predictions
-
-        n_quantiles = raw_predictions.shape[-1]
-
-        if n_quantiles % 2 == 0:
-            raise ValueError("Number of quantiles must be odd (need a median).")
-
-        n_pairs = (n_quantiles - 1) // 2
-
-        # First output is the median (unconstrained)
-        median = raw_predictions[..., 0:1]
-
-        # Lower deltas: indices 1 to n_pairs (inner to outer from median)
-        lower_deltas = jax.nn.softplus(raw_predictions[..., 1 : n_pairs + 1])
-
-        # Upper deltas: indices n_pairs+1 to end (inner to outer from median)
-        upper_deltas = jax.nn.softplus(raw_predictions[..., n_pairs + 1 :])
-
-        # Cumulative sums to enforce monotonicity
-        lower_cumsum = jnp.cumsum(lower_deltas, axis=-1)
-        upper_cumsum = jnp.cumsum(upper_deltas, axis=-1)
-
-        # Lower quantiles: median - cumsum, flip so outermost (q10) comes first
-        lower_quantiles = median - jnp.flip(lower_cumsum, axis=-1)
-
-        # Upper quantiles: median + cumsum
-        upper_quantiles = median + upper_cumsum
-
-        return jnp.concatenate([lower_quantiles, median, upper_quantiles], axis=-1)
-
     def __call__(
         self,
         predictions: Array,
@@ -150,17 +82,14 @@ class QuantileLoss:
         """Compute mean quantile loss.
 
         Args:
-            predictions: Raw model output, shape (..., num_quantiles).
-                If enforce_monotonicity=True, these are transformed first.
+            predictions: Quantile predictions, shape (..., num_quantiles).
+                Should be pre-transformed (e.g., via QuantileHead.params_from_raw).
             targets: Ground truth values, shape (..., 1).
             mask: Optional mask, shape (..., 1). 1 = valid, 0 = ignore.
 
         Returns:
             Scalar mean quantile loss.
         """
-        # Transform to monotonic quantiles if enabled
-        predictions = self.transform_predictions(predictions)
-
         # Expand targets for broadcasting: (...) -> (..., 1)
         targets_expanded = targets[..., jnp.newaxis]
 
@@ -242,3 +171,26 @@ class QuantileLoss:
             total_weight += weight
 
         return total_loss / max(total_weight, 1.0)
+
+def interval_regularization(
+    quantile_values: Array,
+    taus: Array,
+    min_scale: float = 1.0,
+) -> Array:
+    """Penalize intervals that are too narrow relative to probability mass.
+
+    Encourages spread between quantiles to prevent collapse to the median.
+
+    Args:
+        quantile_values: Predicted quantile values, shape (..., num_quantiles).
+        taus: Quantile levels, shape (num_quantiles,).
+        min_scale: Minimum allowed width per unit probability mass.
+
+    Returns:
+        Scalar mean shortfall penalty.
+    """
+    widths = jnp.diff(quantile_values, axis=-1)
+    delta_tau = jnp.diff(taus)
+    min_widths = min_scale * delta_tau
+    shortfall = jnp.maximum(0, min_widths - widths)
+    return jnp.mean(shortfall)

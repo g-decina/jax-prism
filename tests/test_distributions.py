@@ -271,6 +271,69 @@ class TestGaussianHeadQuantile:
         assert spread_wide > spread_narrow
 
 
+class TestGaussianHeadCdf:
+    """Tests for GaussianHead.cdf."""
+
+    def test_output_shape(self):
+        """CDF output shape should match input shape."""
+        head = GaussianHead()
+        params = {"loc": jnp.zeros((4, 8, 1)), "scale": jnp.ones((4, 8, 1))}
+        x = jnp.zeros((4, 8, 1))
+
+        cdf = head.cdf(params, x)
+
+        chex.assert_shape(cdf, (4, 8, 1))
+
+    def test_cdf_at_mean_is_half(self):
+        """CDF at mean should be 0.5 for symmetric Gaussian."""
+        head = GaussianHead()
+        loc = jnp.array([[3.0], [-2.0], [0.0]])
+        params = {"loc": loc, "scale": jnp.ones((3, 1))}
+
+        cdf = head.cdf(params, loc)
+
+        chex.assert_trees_all_close(cdf, jnp.full((3, 1), 0.5), atol=1e-5)
+
+    def test_cdf_monotonic(self):
+        """CDF should be monotonically increasing."""
+        head = GaussianHead()
+        params = {"loc": jnp.array([[0.0]]), "scale": jnp.array([[1.0]])}
+        x = jnp.array([[-2.0], [-1.0], [0.0], [1.0], [2.0]])
+
+        cdf = head.cdf(params, x)
+
+        # Each successive value should be larger
+        for i in range(len(x) - 1):
+            assert cdf[i + 1, 0] > cdf[i, 0]
+
+    def test_cdf_bounds(self):
+        """CDF should approach 0 and 1 at extremes."""
+        head = GaussianHead()
+        params = {"loc": jnp.array([[0.0]]), "scale": jnp.array([[1.0]])}
+
+        cdf_low = head.cdf(params, jnp.array([[-10.0]]))
+        cdf_high = head.cdf(params, jnp.array([[10.0]]))
+
+        assert cdf_low[0, 0] < 0.01
+        assert cdf_high[0, 0] > 0.99
+
+    def test_cdf_quantile_inverse(self):
+        """CDF and quantile should be inverses."""
+        head = GaussianHead()
+        params = {"loc": jnp.array([[2.0]]), "scale": jnp.array([[0.5]])}
+        q = jnp.array([0.1, 0.5, 0.9])
+
+        # quantile -> cdf should recover q
+        x = head.quantile(params, q)  # Shape: (1, 3)
+        # Need to reshape for cdf which expects (..., 1)
+        recovered_q = jnp.stack([
+            head.cdf(params, x[..., i:i+1])[..., 0] for i in range(3)
+        ], axis=-1)
+
+        # Squeeze batch dimension for comparison
+        chex.assert_trees_all_close(recovered_q.squeeze(), q, atol=1e-5)
+
+
 class TestGaussianHeadNumParams:
     """Tests for GaussianHead.num_params."""
 
@@ -367,7 +430,7 @@ class TestQuantileHeadParamsFromRaw:
     def test_values_unchanged(self, rng_key):
         """Raw values should pass through unchanged."""
         quantiles = jnp.array([0.1, 0.5, 0.9])
-        head = QuantileHead(quantiles)
+        head = QuantileHead(quantiles, enforce_monotonicity=False)
         raw = jax.random.normal(rng_key, (4, 8, 3))
 
         params = head.params_from_raw(raw)
@@ -499,7 +562,7 @@ class TestQuantileHeadMedian:
     def test_median_interpolation(self):
         """Median should interpolate when 0.5 is not in quantiles."""
         quantiles = jnp.array([0.25, 0.75])  # No 0.5
-        head = QuantileHead(quantiles)
+        head = QuantileHead(quantiles, enforce_monotonicity=False)
         qv = jnp.array([[2.0, 6.0]])  # Should interpolate to 4.0
         params = {"quantile_values": qv, "quantile_levels": quantiles}
 
@@ -627,3 +690,152 @@ class TestQuantileHeadJAXCompatibility:
         grads = jax.grad(loss_fn)(raw)
 
         assert not jnp.any(jnp.isnan(grads))
+
+
+class TestQuantileHeadCdf:
+    """Tests for QuantileHead.cdf."""
+
+    def test_output_shape(self):
+        """CDF output shape should match input shape."""
+        quantiles = jnp.array([0.1, 0.5, 0.9])
+        head = QuantileHead(quantiles)
+        qv = jnp.array([[1.0, 5.0, 9.0], [2.0, 6.0, 10.0]])  # (2, 3)
+        params = {"quantile_values": qv, "quantile_levels": quantiles}
+        x = jnp.array([[5.0], [6.0]])  # (2, 1)
+
+        cdf = head.cdf(params, x)
+
+        chex.assert_shape(cdf, (2, 1))
+
+    def test_cdf_at_median_is_half(self):
+        """CDF at median quantile value should be 0.5."""
+        quantiles = jnp.array([0.1, 0.5, 0.9])
+        head = QuantileHead(quantiles)
+        qv = jnp.array([[1.0, 5.0, 9.0]])  # median is 5.0
+        params = {"quantile_values": qv, "quantile_levels": quantiles}
+        x = jnp.array([[5.0]])
+
+        cdf = head.cdf(params, x)
+
+        chex.assert_trees_all_close(cdf, jnp.array([[0.5]]), atol=1e-5)
+
+    def test_cdf_at_known_quantiles(self):
+        """CDF at quantile values should match quantile levels."""
+        quantiles = jnp.array([0.1, 0.5, 0.9])
+        head = QuantileHead(quantiles)
+        qv = jnp.array([[2.0, 5.0, 8.0]])
+        params = {"quantile_values": qv, "quantile_levels": quantiles}
+
+        # CDF at x=2.0 should be 0.1
+        cdf_low = head.cdf(params, jnp.array([[2.0]]))
+        chex.assert_trees_all_close(cdf_low, jnp.array([[0.1]]), atol=1e-5)
+
+        # CDF at x=8.0 should be 0.9
+        cdf_high = head.cdf(params, jnp.array([[8.0]]))
+        chex.assert_trees_all_close(cdf_high, jnp.array([[0.9]]), atol=1e-5)
+
+    def test_cdf_monotonic(self):
+        """CDF should be monotonically increasing."""
+        quantiles = jnp.array([0.1, 0.5, 0.9])
+        head = QuantileHead(quantiles)
+        qv = jnp.array([[1.0, 5.0, 9.0]])
+        params = {"quantile_values": qv, "quantile_levels": quantiles}
+
+        # Test at multiple x values
+        cdfs = []
+        for x_val in [1.0, 3.0, 5.0, 7.0, 9.0]:
+            cdf = head.cdf(params, jnp.array([[x_val]]))
+            cdfs.append(cdf[0, 0])
+
+        # Each successive value should be larger or equal
+        for i in range(len(cdfs) - 1):
+            assert cdfs[i + 1] >= cdfs[i]
+
+    def test_cdf_bounds(self):
+        """CDF should be bounded by quantile level range."""
+        quantiles = jnp.array([0.1, 0.5, 0.9])
+        head = QuantileHead(quantiles)
+        qv = jnp.array([[1.0, 5.0, 9.0]])
+        params = {"quantile_values": qv, "quantile_levels": quantiles}
+
+        # Below lowest quantile value
+        cdf_below = head.cdf(params, jnp.array([[0.0]]))
+        # Above highest quantile value
+        cdf_above = head.cdf(params, jnp.array([[10.0]]))
+
+        # jnp.interp clamps to edge values
+        chex.assert_trees_all_close(cdf_below, jnp.array([[0.1]]), atol=1e-5)
+        chex.assert_trees_all_close(cdf_above, jnp.array([[0.9]]), atol=1e-5)
+
+
+class TestQuantileHeadQuantile:
+    """Tests for QuantileHead.quantile."""
+
+    def test_output_shape(self):
+        """Quantile output shape should be (..., num_quantiles)."""
+        quantiles = jnp.array([0.1, 0.5, 0.9])
+        head = QuantileHead(quantiles)
+        qv = jnp.array([[1.0, 5.0, 9.0], [2.0, 6.0, 10.0]])  # (2, 3)
+        params = {"quantile_values": qv, "quantile_levels": quantiles}
+        q = jnp.array([0.25, 0.75])
+
+        result = head.quantile(params, q)
+
+        chex.assert_shape(result, (2, 2))  # (batch, num_q)
+
+    def test_quantile_at_known_levels(self):
+        """Quantile at known levels should return stored values."""
+        quantiles = jnp.array([0.1, 0.5, 0.9])
+        head = QuantileHead(quantiles)
+        qv = jnp.array([[2.0, 5.0, 8.0]])
+        params = {"quantile_values": qv, "quantile_levels": quantiles}
+        q = jnp.array([0.1, 0.5, 0.9])
+
+        result = head.quantile(params, q)
+
+        chex.assert_trees_all_close(result, jnp.array([[2.0, 5.0, 8.0]]), atol=1e-5)
+
+    def test_quantile_interpolation(self):
+        """Quantile at intermediate levels should interpolate."""
+        quantiles = jnp.array([0.0, 1.0])
+        head = QuantileHead(quantiles, enforce_monotonicity=False)
+        qv = jnp.array([[0.0, 10.0]])  # Linear from 0 to 10
+        params = {"quantile_values": qv, "quantile_levels": quantiles}
+        q = jnp.array([0.5])
+
+        result = head.quantile(params, q)
+
+        chex.assert_trees_all_close(result, jnp.array([[5.0]]), atol=1e-5)
+
+    def test_quantiles_ordered(self):
+        """Lower quantile levels should give lower values."""
+        quantiles = jnp.array([0.1, 0.5, 0.9])
+        head = QuantileHead(quantiles)
+        qv = jnp.array([[1.0, 5.0, 9.0]])
+        params = {"quantile_values": qv, "quantile_levels": quantiles}
+        q = jnp.array([0.2, 0.5, 0.8])
+
+        result = head.quantile(params, q)
+
+        # q=0.2 < q=0.5 < q=0.8
+        assert result[0, 0] < result[0, 1]
+        assert result[0, 1] < result[0, 2]
+
+    def test_cdf_quantile_inverse(self):
+        """CDF and quantile should be approximate inverses."""
+        quantiles = jnp.array([0.1, 0.5, 0.9])
+        head = QuantileHead(quantiles)
+        qv = jnp.array([[1.0, 5.0, 9.0]])
+        params = {"quantile_values": qv, "quantile_levels": quantiles}
+        q = jnp.array([0.2, 0.5, 0.8])
+
+        # quantile -> cdf should recover q (within interpolation bounds)
+        x = head.quantile(params, q)  # Shape: (1, 3)
+
+        # For each quantile level, compute CDF
+        recovered_q = jnp.stack([
+            head.cdf(params, x[..., i:i+1])[..., 0] for i in range(3)
+        ], axis=-1)
+
+        # Squeeze batch dimension for comparison
+        chex.assert_trees_all_close(recovered_q.squeeze(), q, atol=1e-5)

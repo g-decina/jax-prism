@@ -17,23 +17,42 @@ class QuantileHead:
     The model directly outputs quantile values (e.g., 10th, 50th, 90th percentiles).
     This is non-parametric: no assumed distribution family.
 
+    When enforce_monotonicity=True (default), raw outputs are interpreted as:
+        [median, delta_lower_1, ..., delta_lower_k, delta_upper_1, ..., delta_upper_k]
+    and transformed via cumulative softplus to guarantee q_i <= q_{i+1}.
+
     Tradeoff vs Gaussian:
     - More flexible (can capture asymmetry, heavy tails)
     - No closed-form density (can't compute exact log_prob)
-    - Quantiles may cross if not constrained
 
     Attributes:
         quantiles: Array of quantile levels, e.g., [0.1, 0.5, 0.9].
+        enforce_monotonicity: Whether to enforce quantile ordering.
     """
 
-    def __init__(self, quantiles: Array):
+    def __init__(
+        self, 
+        quantiles: Array,
+        enforce_monotonicity: bool = True,
+    ):
         """Initialize with target quantile levels.
 
         Args:
             quantiles: 1D array of quantile levels in (0, 1).
                     Should be sorted ascending.
+            enforce_monotonicity: Whether to enforce q_i <= q_{i+1}.
+                    Defaults to True.
         """
         self.quantiles = jnp.asarray(quantiles)
+        
+        if enforce_monotonicity:
+            if len(self.quantiles) % 2 != 1:
+                raise ValueError(
+                    f"An odd number of quantiles must be provided for monotonicity to be enforced."
+                )
+        
+        self.enforce_monotonicity = enforce_monotonicity
+        
 
     @property
     def num_params(self) -> int:
@@ -43,16 +62,46 @@ class QuantileHead:
     def params_from_raw(self, raw: Array) -> dict[str, Array]:
         """Transform raw output to quantile values.
 
+        When enforce_monotonicity=True, raw is interpreted as:
+            [median, delta_lower_1, ..., delta_lower_k, delta_upper_1, ..., delta_upper_k]
+        where deltas are passed through softplus and cumsum to enforce ordering.
+
         Args:
             raw: Raw output, shape (..., num_quantiles).
 
         Returns:
             Dictionary with 'quantile_values' and 'quantile_levels'.
         """
-        return {
-            "quantile_values": raw,
-            "quantile_levels": self.quantiles,
-        }
+        if self.enforce_monotonicity:
+            n_pairs = (len(self.quantiles) - 1) // 2 
+            # First output is the median (unconstrained)
+            median = raw[..., 0:1]
+            # Lower deltas: indices 1 to n_pairs (inner to outer from median)
+            lower_deltas = jax.nn.softplus(raw[..., 1 : n_pairs + 1])
+            # Upper deltas: indices n_pairs+1 to end (inner to outer from median)
+            upper_deltas = jax.nn.softplus(raw[..., n_pairs + 1 :])
+            
+            # Cumulative sums to enforce monotonicity
+            lower_cumsum = jnp.cumsum(lower_deltas, axis=-1)
+            upper_cumsum = jnp.cumsum(upper_deltas, axis=-1)
+
+            # Lower quantiles: median - cumsum, flip so outermost (q10) comes first
+            lower_quantiles = median - jnp.flip(lower_cumsum, axis=-1)
+
+            # Upper quantiles: median + cumsum
+            upper_quantiles = median + upper_cumsum
+
+            vals = jnp.concatenate([lower_quantiles, median, upper_quantiles], axis=-1)
+            return {
+                "quantile_values": vals,
+                "quantile_levels": self.quantiles,
+            }
+        
+        else:
+            return {
+                "quantile_values": raw,
+                "quantile_levels": self.quantiles,
+            }
 
     def log_prob(self, params: dict[str, Array], targets: Array) -> Array:
         """Not well-defined for quantile regression.
@@ -172,3 +221,55 @@ class QuantileHead:
             flat_lower.reshape(original_shape + (1,)),
             flat_upper.reshape(original_shape + (1,)),
         )
+
+    def cdf(self, params: dict[str, Array], x: Array) -> Array:
+        """Compute cumulative distribution function P(X <= x).
+
+        Approximates CDF by linear interpolation between quantile values.
+
+        Args:
+            params: Dict with 'quantile_values' and 'quantile_levels'.
+            x: Values at which to evaluate CDF, shape (..., 1).
+
+        Returns:
+            CDF values in [0, 1], shape (..., 1).
+        """
+        quantile_values = params["quantile_values"]  # (..., Q)
+        quantile_levels = params["quantile_levels"]  # (Q,)
+
+        # Interpolate: given x, find corresponding quantile level
+        # jnp.interp(x, xp, fp) where xp=quantile_values, fp=quantile_levels
+        original_shape = x.shape[:-1]
+        flat_x = x.reshape(-1)
+        flat_qv = quantile_values.reshape(-1, len(quantile_levels))
+
+        def interp_cdf(x_val, qv_row):
+            return jnp.interp(x_val, qv_row, quantile_levels)
+
+        flat_cdf = jax.vmap(interp_cdf)(flat_x, flat_qv)
+        return flat_cdf.reshape(original_shape + (1,))
+
+    def quantile(self, params: dict[str, Array], q: Array) -> Array:
+        """Compute quantile function (inverse CDF).
+
+        Returns x such that P(X <= x) = q, via linear interpolation.
+
+        Args:
+            params: Dict with 'quantile_values' and 'quantile_levels'.
+            q: Quantile levels in (0, 1), shape (num_quantiles,).
+
+        Returns:
+            Quantile values, shape (..., num_quantiles).
+        """
+        quantile_values = params["quantile_values"]  # (..., Q)
+        quantile_levels = params["quantile_levels"]  # (Q,)
+
+        original_shape = quantile_values.shape[:-1]
+        flat_qv = quantile_values.reshape(-1, len(quantile_levels))
+
+        def interp_quantile(qv_row):
+            return jnp.interp(q, quantile_levels, qv_row)
+
+        # Result: (num_batch, num_q)
+        flat_result = jax.vmap(interp_quantile)(flat_qv)
+        return flat_result.reshape(original_shape + (len(q),))

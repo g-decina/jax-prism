@@ -85,17 +85,31 @@ class GaussianHead:
         """Return the distribution mean (point prediction)."""
         return params["loc"]
 
-    def quantile(self, params: Dict[str, Array], q: Array) -> Array:
-        """Compute quantiles of the Gaussian.
+    def cdf(self, params: Dict[str, Array], x: Array) -> Array:
+        """Compute cumulative distribution function P(X <= x).
 
         Args:
             params: Dict with 'loc' and 'scale'.
-            q: Quantile levels in [0, 1], shape (num_quantiles,).
+            x: Values at which to evaluate CDF, shape (..., 1).
+
+        Returns:
+            CDF values in [0, 1], shape (..., 1).
+        """
+        return jax.scipy.stats.norm.cdf(x, loc=params["loc"], scale=params["scale"])
+
+    def quantile(self, params: Dict[str, Array], q: Array) -> Array:
+        """Compute quantile function (inverse CDF).
+
+        Returns x such that P(X <= x) = q.
+
+        Args:
+            params: Dict with 'loc' and 'scale'.
+            q: Quantile levels in (0, 1), shape (num_quantiles,).
 
         Returns:
             Quantile values, shape (..., num_quantiles).
         """
         standard_quantiles = jax.scipy.stats.norm.ppf(q)
-        
+
         # loc/scale: (..., 1), standard_quantiles: (Q,) → broadcast to (..., Q)
         return params["loc"] + params["scale"] * standard_quantiles

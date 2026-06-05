@@ -354,7 +354,7 @@ class TestQuantileLossBehavior:
         """Loss should be zero when predictions equal targets at all quantiles."""
         quantiles = jnp.array([0.1, 0.5, 0.9])
         # Disable both monotonicity and calibration to test pure pinball loss
-        loss_fn = QuantileLoss(quantiles, enforce_monotonicity=False, calibration_weight=0.0)
+        loss_fn = QuantileLoss(quantiles, calibration_weight=0.0)
 
         targets = jnp.array([1.0, 2.0, 3.0])
         # Predictions: each target repeated for all quantiles
