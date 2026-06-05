@@ -22,7 +22,7 @@ pip install jax-prism
 Or install from source:
 
 ```bash
-git clone https://github.com/lexicon-automata/jax-prism.git
+git clone https://github.com/g-decina/jax-prism
 cd jax-prism
 poetry install
 ```
@@ -218,9 +218,9 @@ Apache 2.0
 ```bibtex
 @software{jax_prism,
   title = {JAX-Prism: Privacy-Preserving Probabilistic Forecasting},
-  author = {Lexicon Automata},
-  year = {2025},
-  url = {https://github.com/lexicon-automata/jax-prism}
+  author = {Guillaume Decina},
+  year = {2026},
+  url = {https://github.com/g-decina/jax-prism}
 }
 ```
 
