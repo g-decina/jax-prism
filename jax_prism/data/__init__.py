@@ -1,7 +1,7 @@
 """Data handling for JAX-Prism."""
 
 from jax_prism.data.batch import TimeSeriesBatch
-from jax_prism.data.dataset import TimeSeriesDataset
+from jax_prism.data.dataset import TimeSeriesDataset, stack_batches
 from jax_prism.data.scaling import (
     fixed_scale,
     inverse_scale,
@@ -17,6 +17,7 @@ __all__ = [
     "TimeSeriesDataset",
     # Windowing
     "create_sliding_windows",
+    "stack_batches",
     # Scaling functions
     "last_value_scale",
     "median_scale",

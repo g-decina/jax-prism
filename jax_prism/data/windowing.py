@@ -1,9 +1,8 @@
 import jax.numpy as jnp
 from jax_prism.data.batch import TimeSeriesBatch
-from jax_prism.data.dataset import TimeSeriesDataset
 
 def create_sliding_windows(
-    dataset: TimeSeriesDataset,
+    dataset: "TimeSeriesDataset",
     context_len: int,
     horizon_len: int,
     stride: int = 1,

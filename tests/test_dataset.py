@@ -6,7 +6,11 @@ import pandas as pd
 import pytest
 from chex import assert_shape, assert_trees_all_close
 
-from jax_prism.data.dataset import TimeSeriesDataset
+from jax_prism.data.dataset import (
+    TimeSeriesDataset,
+    stack_batches,
+    _detect_gaps,
+)
 from jax_prism.data.windowing import create_sliding_windows
 
 
@@ -57,7 +61,7 @@ class TestTimeSeriesDataset:
 
     def test_validation_rejects_0d_targets(self):
         """Scalar targets raise ValueError."""
-        with pytest.raises(ValueError, match="at least be 1D"):
+        with pytest.raises(ValueError, match="at least 1D"):
             TimeSeriesDataset(targets=jnp.array(5.0))
 
     def test_validation_rejects_length_mismatch_known(self):
@@ -150,7 +154,7 @@ class TestTimeSeriesDatasetFromDataframe:
 
         ds = TimeSeriesDataset.from_dataframe(
             df,
-            target_col="target",
+            target_cols="target",
             known_cols=["known_a", "known_b"],
         )
 
@@ -167,7 +171,7 @@ class TestTimeSeriesDatasetFromDataframe:
 
         ds = TimeSeriesDataset.from_dataframe(
             df,
-            target_col="target",
+            target_cols="target",
             static_cols=["static_id"],
         )
 
@@ -177,7 +181,7 @@ class TestTimeSeriesDatasetFromDataframe:
     def test_returns_jax_arrays(self):
         """Output arrays are JAX arrays, not NumPy."""
         df = pd.DataFrame({"target": [1.0, 2.0, 3.0]})
-        ds = TimeSeriesDataset.from_dataframe(df, target_col="target")
+        ds = TimeSeriesDataset.from_dataframe(df, target_cols="target")
 
         # jax.Array has device attribute
         assert hasattr(ds.targets, "device") or isinstance(ds.targets, jnp.ndarray)
@@ -185,7 +189,7 @@ class TestTimeSeriesDatasetFromDataframe:
     def test_none_columns_stay_none(self):
         """Columns not specified remain None."""
         df = pd.DataFrame({"target": [1.0, 2.0, 3.0]})
-        ds = TimeSeriesDataset.from_dataframe(df, target_col="target")
+        ds = TimeSeriesDataset.from_dataframe(df, target_cols="target")
 
         assert ds.known_covariates is None
         assert ds.observed_covariates is None
@@ -306,4 +310,257 @@ class TestCreateSlidingWindows:
             assert_shape(batch.static_covariates, (1, 2))
             assert_trees_all_close(
                 batch.static_covariates[0], jnp.array([42.0, 99.0])
+            )
+
+
+class TestToBatches:
+    """Tests for TimeSeriesDataset.to_batches() method."""
+
+    def test_basic_to_batches(self):
+        """to_batches returns stacked TimeSeriesBatch."""
+        ds = TimeSeriesDataset(targets=jnp.arange(20.0))
+        batch = ds.to_batches(context_len=5, horizon_len=3, stride=1)
+
+        # Should have 13 windows stacked
+        assert_shape(batch.past_targets, (13, 5))
+        assert_shape(batch.future_targets, (13, 3))
+
+    def test_to_batches_with_covariates(self):
+        """to_batches preserves covariates in stacked batch."""
+        T = 20
+        ds = TimeSeriesDataset(
+            targets=jnp.arange(T, dtype=jnp.float32),
+            known_covariates=jnp.ones((T, 2)),
+            observed_covariates=jnp.ones((T, 3)),
+        )
+        batch = ds.to_batches(context_len=5, horizon_len=3)
+
+        assert_shape(batch.past_known_covariates, (13, 5, 2))
+        assert_shape(batch.future_known_covariates, (13, 3, 2))
+        assert_shape(batch.past_observed_covariates, (13, 5, 3))
+
+    def test_to_batches_with_stride(self):
+        """to_batches respects stride parameter."""
+        ds = TimeSeriesDataset(targets=jnp.arange(20.0))
+        batch = ds.to_batches(context_len=5, horizon_len=3, stride=4)
+
+        # (20-8)//4 + 1 = 4 windows
+        assert_shape(batch.past_targets, (4, 5))
+
+    def test_to_batches_content(self):
+        """to_batches produces correct window content."""
+        ds = TimeSeriesDataset(targets=jnp.arange(10.0))
+        batch = ds.to_batches(context_len=3, horizon_len=2, stride=1)
+
+        # First window: past=[0,1,2], future=[3,4]
+        assert_trees_all_close(batch.past_targets[0], jnp.array([0.0, 1.0, 2.0]))
+        assert_trees_all_close(batch.future_targets[0], jnp.array([3.0, 4.0]))
+
+        # Second window: past=[1,2,3], future=[4,5]
+        assert_trees_all_close(batch.past_targets[1], jnp.array([1.0, 2.0, 3.0]))
+        assert_trees_all_close(batch.future_targets[1], jnp.array([4.0, 5.0]))
+
+
+class TestStackBatches:
+    """Tests for stack_batches utility."""
+
+    def test_stack_batches_basic(self):
+        """stack_batches combines list into single batch."""
+        ds = TimeSeriesDataset(targets=jnp.arange(20.0))
+        windows = create_sliding_windows(ds, context_len=5, horizon_len=3)
+
+        stacked = stack_batches(windows)
+
+        assert_shape(stacked.past_targets, (13, 5))
+        assert_shape(stacked.future_targets, (13, 3))
+
+    def test_stack_batches_empty_raises(self):
+        """stack_batches raises on empty list."""
+        with pytest.raises(ValueError, match="empty"):
+            stack_batches([])
+
+    def test_stack_batches_preserves_none(self):
+        """stack_batches keeps None fields as None."""
+        ds = TimeSeriesDataset(targets=jnp.arange(20.0))
+        windows = create_sliding_windows(ds, context_len=5, horizon_len=3)
+
+        stacked = stack_batches(windows)
+
+        assert stacked.past_known_covariates is None
+        assert stacked.past_observed_covariates is None
+        assert stacked.static_covariates is None
+
+
+class TestLazyCovariateClassification:
+    """Tests for lazy covariate classification via covariate_cols."""
+
+    def test_covariate_cols_stores_unclassified(self):
+        """covariate_cols populates _unclassified_covariates."""
+        df = pd.DataFrame({
+            "target": [1.0, 2.0, 3.0, 4.0, 5.0],
+            "cov_a": [10.0, 20.0, 30.0, 40.0, 50.0],
+            "cov_b": [100.0, 200.0, 300.0, 400.0, 500.0],
+        })
+
+        ds = TimeSeriesDataset.from_dataframe(
+            df,
+            target_cols="target",
+            covariate_cols=["cov_a", "cov_b"],
+        )
+
+        assert ds._unclassified_covariates is not None
+        assert_shape(ds._unclassified_covariates, (5, 2))
+        assert ds.known_covariates is None
+        assert ds.observed_covariates is None
+
+    def test_classification_by_nan_in_future(self):
+        """Covariates with NaN in last rows are classified as observed."""
+        # Simulate: day_of_week is known (no NaN), temperature is observed (NaN in future)
+        T = 10
+        horizon = 3
+
+        day_of_week = jnp.arange(T, dtype=jnp.float32)  # All populated
+        temperature = jnp.arange(T, dtype=jnp.float32)
+        # Set last horizon_len values to NaN for temperature
+        temperature = temperature.at[-horizon:].set(jnp.nan)
+
+        covariates = jnp.stack([day_of_week, temperature], axis=-1)
+
+        ds = TimeSeriesDataset(
+            targets=jnp.arange(T, dtype=jnp.float32),
+            _unclassified_covariates=covariates,
+        )
+
+        known, observed = ds._classify_covariates(horizon_len=horizon)
+
+        # day_of_week should be known (column 0)
+        assert known is not None
+        assert_shape(known, (T, 1))
+
+        # temperature should be observed (column 1)
+        assert observed is not None
+        assert_shape(observed, (T, 1))
+
+    def test_to_batches_classifies_covariates(self):
+        """to_batches performs classification before windowing."""
+        T = 15
+        horizon = 3
+
+        # Create DataFrame with known and observed pattern
+        df = pd.DataFrame({
+            "target": np.arange(T, dtype=np.float32),
+            "day_of_week": np.arange(T, dtype=np.float32),  # Known
+            "temperature": np.concatenate([
+                np.arange(T - horizon, dtype=np.float32),
+                np.full(horizon, np.nan),  # NaN in future
+            ]),
+        })
+
+        ds = TimeSeriesDataset.from_dataframe(
+            df,
+            target_cols="target",
+            covariate_cols=["day_of_week", "temperature"],
+        )
+
+        batch = ds.to_batches(context_len=5, horizon_len=horizon)
+
+        # Should have future_known_covariates (day_of_week)
+        assert batch.future_known_covariates is not None
+
+        # Should have past_observed_covariates (temperature)
+        assert batch.past_observed_covariates is not None
+
+    def test_mutual_exclusivity_error(self):
+        """Cannot specify both explicit and lazy modes."""
+        df = pd.DataFrame({
+            "target": [1.0, 2.0, 3.0],
+            "cov": [10.0, 20.0, 30.0],
+        })
+
+        with pytest.raises(ValueError, match="Cannot specify both"):
+            TimeSeriesDataset.from_dataframe(
+                df,
+                target_cols="target",
+                known_cols=["cov"],
+                covariate_cols=["cov"],
+            )
+
+    def test_all_known_classification(self):
+        """When no NaN in future, all covariates classified as known."""
+        T = 10
+        covariates = jnp.ones((T, 3))  # All populated
+
+        ds = TimeSeriesDataset(
+            targets=jnp.ones(T),
+            _unclassified_covariates=covariates,
+        )
+
+        known, observed = ds._classify_covariates(horizon_len=3)
+
+        assert known is not None
+        assert_shape(known, (T, 3))
+        assert observed is None
+
+    def test_all_observed_classification(self):
+        """When all have NaN in future, all classified as observed."""
+        T = 10
+        horizon = 3
+        covariates = jnp.ones((T, 2))
+        covariates = covariates.at[-horizon:, :].set(jnp.nan)
+
+        ds = TimeSeriesDataset(
+            targets=jnp.ones(T),
+            _unclassified_covariates=covariates,
+        )
+
+        known, observed = ds._classify_covariates(horizon_len=horizon)
+
+        assert known is None
+        assert observed is not None
+        assert_shape(observed, (T, 2))
+
+
+class TestGapDetection:
+    """Tests for timestamp gap detection."""
+
+    def test_no_gaps_detected(self):
+        """Regular timestamps produce no gaps."""
+        timestamps = jnp.arange(10)
+        gaps = _detect_gaps(timestamps)
+
+        assert gaps == []
+
+    def test_single_gap_detected(self):
+        """Single missing timestamp is detected."""
+        # 0, 1, 2, 4, 5, 6 (3 is missing)
+        timestamps = jnp.array([0, 1, 2, 4, 5, 6])
+        gaps = _detect_gaps(timestamps)
+
+        assert len(gaps) == 1
+        assert gaps[0] == (2, 3)  # Gap between index 2 and 3
+
+    def test_multiple_gaps_detected(self):
+        """Multiple gaps are all detected."""
+        # 0, 1, 3, 4, 6, 7 (2 and 5 missing)
+        timestamps = jnp.array([0, 1, 3, 4, 6, 7])
+        gaps = _detect_gaps(timestamps)
+
+        assert len(gaps) == 2
+        assert (1, 2) in gaps  # Gap after index 1
+        assert (3, 4) in gaps  # Gap after index 3
+
+    def test_short_sequence_no_gaps(self):
+        """Sequence with < 2 elements returns empty."""
+        assert _detect_gaps(jnp.array([1])) == []
+        assert _detect_gaps(jnp.array([])) == []
+
+    def test_gap_warning_emitted(self):
+        """Creating dataset with gaps emits warning."""
+        # Timestamps with gap
+        timestamps = jnp.array([0, 1, 2, 5, 6, 7])  # 3, 4 missing
+
+        with pytest.warns(UserWarning, match="gap"):
+            TimeSeriesDataset(
+                targets=jnp.ones(6),
+                timestamps=timestamps,
             )
