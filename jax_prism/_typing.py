@@ -10,7 +10,6 @@ from typing import (
     Dict,
     Mapping,
     Protocol,
-    Sequence,
     Tuple,
     TypeVar,
     Union,
@@ -307,3 +306,53 @@ class ForecastModel(Protocol):
             Raw output parameters for the distribution head.
         """
         ...
+
+
+# =============================================================================
+# Result Class
+# =============================================================================
+
+@struct.dataclass
+class UncertaintyOutput:
+    """Standardized container for probabilistic predictions.
+
+    Packages point forecasts with prediction intervals at specified coverage
+    levels. Produced by model.predict() at inference time, consumed by
+    evaluation metrics and visualization utilities.
+
+    Shape Convention:
+        - point: (B, T, 1) — central prediction (mean or median)
+        - lower: (B, T, num_intervals) — lower bounds for each coverage level
+        - upper: (B, T, num_intervals) — upper bounds for each coverage level
+        - levels: tuple of floats — coverage levels in (0, 1), e.g., (0.5, 0.8, 0.9)
+
+        For a single interval (e.g., 80% PI), lower/upper have shape (B, T, 1).
+        For multiple intervals, the last dimension indexes the coverage level.
+
+    Optional Fields:
+        - mu, sigma: Populated for Gaussian outputs, enabling CRPS computation
+        - samples: Populated for Bayesian predictions with posterior samples,
+          shape (num_samples, B, T, 1)
+
+    Example:
+        >>> # From Gaussian distribution
+        >>> output = UncertaintyOutput(
+        ...     point=mu,
+        ...     lower=mu - 1.96 * sigma,  # 95% interval
+        ...     upper=mu + 1.96 * sigma,
+        ...     levels=(0.95,),
+        ...     mu=mu,
+        ...     sigma=sigma,
+        ... )
+        >>> # Compute metrics
+        >>> crps = crps_gaussian(y_true, output.mu, output.sigma)
+        >>> cov = coverage(y_true, output.lower, output.upper)
+    """
+
+    point: Array
+    lower: Array
+    upper: Array
+    levels: tuple[float, ...]
+    mu: Array | None = None
+    sigma: Array | None = None
+    samples: Array | None = None

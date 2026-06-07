@@ -1,6 +1,7 @@
 """Point forecast metrics: MAE, SMAPE, MASE."""
 
 import jax.numpy as jnp
+
 from jax_prism._typing import Array
 
 
