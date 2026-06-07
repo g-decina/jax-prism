@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "jax-prism"
-version = "0.1.1-dev"
+version = "0.2.1-dev"
 description = "Privacy-preserving probabilistic forecasting with JAX"
 authors = ["Guillaume Decina"]
 readme = "README.md"
