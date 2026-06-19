@@ -7,7 +7,7 @@ import pytest
 from chex import assert_trees_all_close
 
 from jax_prism._typing import UncertaintyOutput
-from jax_prism.metrics.calibration import quantile_calibration_error
+from jax_prism.metrics.calibration import pit_histogram, quantile_calibration_error
 from jax_prism.metrics.crps import crps_gaussian
 from jax_prism.metrics.point import mae, mase, smape
 from jax_prism.metrics.probabilistic import coverage, quantile_loss
@@ -674,3 +674,151 @@ class TestUncertaintyOutput:
         point_np = np.asarray(output.point)
         assert isinstance(point_np, np.ndarray)
         assert point_np.shape == (1, 2, 1)
+
+
+class TestPitHistogram:
+    """Tests for PIT (Probability Integral Transform) histogram."""
+
+    def test_uniform_pit_flat_histogram(self):
+        """Uniform PIT values produce flat histogram (calibrated model)."""
+        # 1000 uniform samples should give roughly equal bin counts
+        key = jax.random.PRNGKey(42)
+        pit_values = jax.random.uniform(key, shape=(1000,))
+
+        edges, counts = pit_histogram(pit_values, num_bins=10)
+
+        # Each bin should have ~10% of mass
+        expected = 0.1
+        assert_trees_all_close(counts, jnp.full(10, expected), atol=0.03)
+
+    def test_counts_sum_to_one(self):
+        """Histogram counts sum to 1."""
+        pit_values = jnp.array([0.1, 0.3, 0.5, 0.7, 0.9])
+        edges, counts = pit_histogram(pit_values, num_bins=5)
+        assert_trees_all_close(counts.sum(), 1.0)
+
+    def test_bin_edges_span_unit_interval(self):
+        """Bin edges span [0, 1]."""
+        pit_values = jnp.array([0.5])
+        edges, counts = pit_histogram(pit_values, num_bins=10)
+
+        assert edges[0] == 0.0
+        assert edges[-1] == 1.0
+        assert len(edges) == 11  # num_bins + 1
+
+    def test_u_shaped_underdispersed(self):
+        """U-shaped histogram indicates underdispersed model."""
+        # Values clustered at 0 and 1 (model intervals too narrow)
+        pit_values = jnp.concatenate([
+            jnp.full(50, 0.05),  # 50 values near 0
+            jnp.full(50, 0.95),  # 50 values near 1
+        ])
+
+        edges, counts = pit_histogram(pit_values, num_bins=10)
+
+        # First and last bins should have most mass
+        assert counts[0] > 0.4  # first bin
+        assert counts[-1] > 0.4  # last bin
+        # Middle bins should have little mass
+        assert counts[4] < 0.05
+        assert counts[5] < 0.05
+
+    def test_inverse_u_overdispersed(self):
+        """Inverse-U histogram indicates overdispersed model."""
+        # Values clustered in middle (model intervals too wide)
+        pit_values = jnp.full(100, 0.5)
+
+        edges, counts = pit_histogram(pit_values, num_bins=10)
+
+        # Middle bin should have all mass
+        assert counts[4] > 0.9 or counts[5] > 0.9
+        # Edge bins should have no mass
+        assert counts[0] == 0.0
+        assert counts[-1] == 0.0
+
+    def test_skewed_left_bias(self):
+        """Left-skewed histogram indicates positive bias in predictions."""
+        # All PIT values near 0 means y_true < predicted (positive bias)
+        pit_values = jnp.full(100, 0.05)  # clearly in first bin [0, 0.1)
+
+        edges, counts = pit_histogram(pit_values, num_bins=10)
+
+        # First bin should have all mass
+        assert counts[0] > 0.9
+        assert counts[-1] == 0.0
+
+    def test_with_mask(self):
+        """Mask excludes elements from histogram."""
+        pit_values = jnp.array([0.05, 0.05, 0.05, 0.95])  # 3 low, 1 high
+        mask = jnp.array([1.0, 1.0, 1.0, 0.0])  # ignore the high value
+
+        edges, counts = pit_histogram(pit_values, num_bins=10, mask=mask)
+
+        # All mass should be in first bin
+        assert counts[0] == 1.0
+        assert counts[-1] == 0.0
+
+    def test_boundary_value_one(self):
+        """Values exactly at 1.0 go to last bin."""
+        pit_values = jnp.array([1.0, 1.0, 1.0])
+
+        edges, counts = pit_histogram(pit_values, num_bins=10)
+
+        # All mass in last bin
+        assert counts[-1] == 1.0
+
+    def test_boundary_value_zero(self):
+        """Values exactly at 0.0 go to first bin."""
+        pit_values = jnp.array([0.0, 0.0, 0.0])
+
+        edges, counts = pit_histogram(pit_values, num_bins=10)
+
+        # All mass in first bin
+        assert counts[0] == 1.0
+
+    def test_multidimensional_input(self):
+        """Handles multidimensional PIT arrays (flattens)."""
+        # Shape (2, 3, 4) = 24 values, all 0.5
+        pit_values = jnp.full((2, 3, 4), 0.5)
+
+        edges, counts = pit_histogram(pit_values, num_bins=10)
+
+        # All 24 values in middle bin
+        assert counts[5] == 1.0 or counts[4] == 1.0
+
+    def test_different_num_bins(self):
+        """Works with different numbers of bins."""
+        pit_values = jnp.linspace(0, 1, 100)
+
+        for num_bins in [5, 10, 20, 50]:
+            edges, counts = pit_histogram(pit_values, num_bins=num_bins)
+            assert len(edges) == num_bins + 1
+            assert len(counts) == num_bins
+            assert_trees_all_close(counts.sum(), 1.0)
+
+    def test_jit_compatible(self):
+        """pit_histogram is JIT-compatible."""
+        pit_values = jnp.array([0.1, 0.3, 0.5, 0.7, 0.9])
+
+        @jax.jit
+        def compute_hist(values):
+            return pit_histogram(values, num_bins=5)
+
+        edges, counts = compute_hist(pit_values)
+        assert_trees_all_close(counts.sum(), 1.0)
+
+    def test_integration_with_gaussian_cdf(self):
+        """Works with CDF values from Gaussian distribution."""
+        # True values
+        y_true = jnp.array([0.0, 1.0, 2.0])
+        # Predicted N(1, 1) distribution
+        mu = jnp.array([1.0, 1.0, 1.0])
+        sigma = jnp.array([1.0, 1.0, 1.0])
+
+        # Compute PIT values
+        pit_values = jax.scipy.stats.norm.cdf(y_true, loc=mu, scale=sigma)
+
+        edges, counts = pit_histogram(pit_values, num_bins=5)
+
+        assert_trees_all_close(counts.sum(), 1.0)
+        assert len(counts) == 5
