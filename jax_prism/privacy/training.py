@@ -23,11 +23,15 @@ from jax_prism.privacy.gradients import dp_gradients
 
 
 class TrainStepOutput(NamedTuple):
-    """Output from a single training step."""
+    """Output from a single training step.
+
+    Used by both DP and non-DP training steps. For non-DP training,
+    accountant will be None.
+    """
 
     params: PyTree
     opt_state: PyTree
-    accountant: PrivacyAccountant
+    accountant: PrivacyAccountant | None
     metrics: dict[str, Array]
 
 
@@ -39,6 +43,7 @@ def make_dp_train_step(
     noise_multiplier: float,
     *,
     target_field: str = "future_targets",
+    grad_transform: Callable[[PyTree], PyTree] | None = None,
 ) -> Callable[
     [PyTree, PyTree, PrivacyAccountant, TimeSeriesBatch, PRNGKey],
     TrainStepOutput,
@@ -50,18 +55,21 @@ def make_dp_train_step(
     2. Clips each gradient to bound sensitivity
     3. Aggregates (averages) clipped gradients
     4. Adds calibrated Gaussian noise
-    5. Updates parameters with optimizer
-    6. Updates privacy accountant
+    5. Optionally transforms gradients (e.g., freeze specific indices)
+    6. Updates parameters with optimizer
+    7. Updates privacy accountant
 
     Args:
-        model_apply: Function (params, batch, training) -> raw_output.
+        model_apply: Function (params, batch, training, rngs) -> raw_output.
             Typically model.apply for a Flax model.
         loss_fn: Loss function conforming to Loss protocol.
             Called as loss_fn(predictions, targets, mask).
         optimizer: Optax optimizer (e.g., optax.adam(1e-3)).
         clip_norm: Maximum L2 norm for per-sample gradients.
         noise_multiplier: σ, ratio of noise std to clip_norm.
-        target_field: Field name in batch for targets (default: "target").
+        target_field: Field name in batch for targets (default: "future_targets").
+        grad_transform: Optional function to transform gradients before optimizer
+            update. Example: lambda g: freeze_output_indices(g, (0,))
 
     Returns:
         A JIT-compiled function with signature:
@@ -85,10 +93,11 @@ def make_dp_train_step(
         >>> # Training loop
         >>> for batch in dataloader:
         ...     key, subkey = jax.random.split(key)
-        ...     params, opt_state, accountant, metrics = train_step(
-        ...         params, opt_state, accountant, batch, subkey
-        ...     )
-        ...     print(f"Loss: {metrics['loss']:.4f}")
+        ...     output = train_step(params, opt_state, accountant, batch, subkey)
+        ...     params = output.params
+        ...     opt_state = output.opt_state
+        ...     accountant = output.accountant
+        ...     print(f"Loss: {output.metrics['loss']:.4f}")
     """
 
     def single_example_loss(params: PyTree, example: TimeSeriesBatch, key: PRNGKey) -> Array:
@@ -130,6 +139,10 @@ def make_dp_train_step(
             key=noise_key,
         )
 
+        # Apply optional gradient transform
+        if grad_transform is not None:
+            dp_grads = grad_transform(dp_grads)
+
         # Compute metrics (on clipped grads before noise for interpretability)
         # We compute loss separately for metrics (no noise influence)
         raw_output = model_apply(params, batch, False, rngs={"dropout": None})
@@ -166,50 +179,3 @@ def make_dp_train_step(
 
     # JIT compile the training step
     return jax.jit(train_step)
-
-
-def make_train_step(
-    model_apply: Callable[[PyTree, TimeSeriesBatch, bool, PRNGKey | None], Array],
-    loss_fn: Loss,
-    optimizer: optax.GradientTransformation,
-    *,
-    target_field: str = "future_targets",
-) -> Callable[[PyTree, PyTree, TimeSeriesBatch, PRNGKey], tuple[PyTree, PyTree, dict]]:
-    """Create a JIT-compiled training step **WITHOUT differential privacy**.
-
-    For comparison and baseline experiments.
-
-    Args:
-        model_apply: Function (params, batch, training, key) -> raw_output.
-        loss_fn: Loss function conforming to Loss protocol.
-        optimizer: Optax optimizer.
-        target_field: Field name in batch for targets.
-
-    Returns:
-        JIT-compiled function: (params, opt_state, batch, key) -> (params, opt_state, metrics)
-    """
-
-    def loss_fn_wrapper(params: PyTree, batch: TimeSeriesBatch, key: PRNGKey) -> Array:
-        raw_output = model_apply(params, batch, True, rngs={"dropout": key})
-        target = getattr(batch, target_field)
-        mask = getattr(batch, "mask", None)
-        return loss_fn(raw_output, target, mask)
-
-    @jax.jit
-    def train_step(
-        params: PyTree,
-        opt_state: PyTree,
-        batch: TimeSeriesBatch,
-        key: PRNGKey
-    ) -> tuple[PyTree, PyTree, dict]:
-        loss_value, grads = jax.value_and_grad(
-            lambda p: loss_fn_wrapper(p, batch, key)
-        )(params)
-
-        updates, new_opt_state = optimizer.update(grads, opt_state, params)
-        new_params = optax.apply_updates(params, updates)
-
-        metrics = {"loss": loss_value}
-        return new_params, new_opt_state, metrics
-
-    return train_step

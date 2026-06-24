@@ -14,7 +14,6 @@ from jax_prism.privacy.noise import add_noise, generate_noise_tree
 from jax_prism.privacy.training import (
     TrainStepOutput,
     make_dp_train_step,
-    make_train_step,
 )
 
 __all__ = [
@@ -22,7 +21,6 @@ __all__ = [
     "RDPAccountant",
     # High-level API
     "make_dp_train_step",
-    "make_train_step",
     "TrainStepOutput",
     # Functional API
     "dp_gradients",
