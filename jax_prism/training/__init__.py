@@ -11,6 +11,11 @@ from jax_prism.training.masking import (
 from jax_prism.training.phased import PhasedTrainer, TrainingPhase
 from jax_prism.training.reinit import reinitialize_param_head
 from jax_prism.training.schedules import warmup_cosine_schedule, warmup_plateau_cosine_schedule
+from jax_prism.training.splitting import (
+    expanding_window_cv,
+    rolling_window_cv,
+    temporal_split,
+)
 
 __all__ = [
     # Phased training
@@ -31,4 +36,8 @@ __all__ = [
     "freeze_output_indices",
     "no_weight_decay_on_bias",
     "no_weight_decay_on_pattern",
+    # Splitting utilities
+    "temporal_split",
+    "expanding_window_cv",
+    "rolling_window_cv",
 ]
